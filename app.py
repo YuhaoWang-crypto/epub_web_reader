@@ -1079,3 +1079,35 @@ with st.expander("在线朗读（Google Gemini TTS：Kore 等，播放 WAV，不
                 except Exception as e:
                     st.error(f"生成失败：{e}")
                     st.caption("检查：是否已设置 GEMINI_API_KEY / GOOGLE_API_KEY，且模型名称可用。")
+
+
+st.subheader("浏览器实时朗读（兜底模式：选段落起点）")
+
+blocks = extract_chapter_blocks(epub_bytes, book, st.session_state.chapter_idx)
+if blocks:
+    start_idx = st.number_input("从第几段开始", 1, len(blocks), 1, 1)
+    count = st.number_input("朗读多少段", 1, min(50, len(blocks)), min(8, len(blocks)), 1)
+    tts_text = "\n\n".join(b["text"] for b in blocks[int(start_idx)-1:int(start_idx)-1+int(count)])
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("开始朗读（浏览器）", use_container_width=True):
+            components.html(
+                f"""
+                <script>
+                  const text = {json.dumps(tts_text)};
+                  speechSynthesis.cancel();
+                  const u = new SpeechSynthesisUtterance(text);
+                  u.lang = "zh-CN";
+                  u.rate = 1.0;
+                  speechSynthesis.speak(u);
+                </script>
+                """,
+                height=0
+            )
+    with col2:
+        if st.button("停止朗读（浏览器）", use_container_width=True):
+            components.html("<script>speechSynthesis.cancel();</script>", height=0)
+else:
+    st.info("本章没有可朗读的段落。")
+
