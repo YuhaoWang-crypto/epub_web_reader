@@ -1259,31 +1259,42 @@ with st.expander("在线朗读（Google Chirp 3 HD：中文 Kore / Vindemiatrix 
 
 
 @st.cache_data(show_spinner=False)
-def translate_en_to_zh_gemini(text: str, model: str = "gemini-2.5-flash") -> str:
+def translate_en_to_zh_gemini(text: str, model: str = "gemini-2.0-flash", style: str = "") -> str:
     """
-    用 Gemini 文本模型把英文翻译成中文（简体）。
-    依赖 GEMINI_API_KEY 或 GOOGLE_API_KEY（环境变量或 Streamlit Secrets）。
+    Gemini 翻译：英文 -> 简体中文
+    依赖：google-genai
+    环境变量：GEMINI_API_KEY 或 GOOGLE_API_KEY
     """
-    api_key = get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError("未检测到 GEMINI_API_KEY / GOOGLE_API_KEY（请在环境变量或 Streamlit Secrets 配置）")
+    if not GEMINI_AVAILABLE:
+        raise RuntimeError("google-genai 未安装：请 pip install google-genai")
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client()
 
     prompt = (
-        "你是一名专业文学译者。请把下面英文翻译成简体中文。\n"
+        "请把下面英文翻译成简体中文。\n"
         "要求：\n"
-        "1) 尽量逐段对应，保留段落换行。\n"
+        "1) 尽量逐段对应（保留段落换行）。\n"
         "2) 不要添加解释、注释或多余内容。\n"
-        "3) 人名/地名保持一致。\n\n"
-        f"{text}"
+        "3) 保持人名/地名一致。\n"
+        "4) 语气自然，保留原文风格。\n"
     )
+    if style.strip():
+        prompt += f"\n额外风格要求：{style.strip()}\n"
+    prompt += "\n---\n" + text
 
     resp = client.models.generate_content(
         model=model,
-        contents=prompt
+        contents=prompt,
     )
-    out = (resp.text or "").strip()
-    if not out:
-        raise RuntimeError("Gemini 未返回可用文本（resp.text 为空）")
-    return out
+
+    # google-genai 的响应通常在 resp.text
+    out = getattr(resp, "text", None)
+    if out and out.strip():
+        return out.strip()
+
+    # 兜底：从 candidates 里取
+    try:
+        return resp.candidates[0].content.parts[0].text.strip()
+    except Exception:
+        raise RuntimeError("Gemini 返回格式异常，未能提取文本。")
+
