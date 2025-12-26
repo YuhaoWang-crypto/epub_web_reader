@@ -1,74 +1,124 @@
 import os
+import asyncio
 import base64
 import hashlib
 import io
+import json
+import posixpath
 import re
+import threading
+import time
 import wave
 import zipfile
 import xml.etree.ElementTree as ET
-import posixpath
 
 import streamlit as st
 import streamlit.components.v1 as components
 from bs4 import BeautifulSoup
 
 # ============================================================
-# 依赖检查
+# Optional dependencies
 # ============================================================
 try:
-    from google import genai
-    from google.genai import types as genai_types
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
+    import edge_tts  # pip install edge-tts
+    EDGE_TTS_AVAILABLE = True
+except Exception:
+    EDGE_TTS_AVAILABLE = False
 
 try:
-    from openai import OpenAI
+    from openai import OpenAI  # pip install openai
     OPENAI_AVAILABLE = True
-except ImportError:
+except Exception:
     OPENAI_AVAILABLE = False
 
-# ============================================================
-# 配置
-# ============================================================
-st.set_page_config(page_title="EPUB AI Reader", layout="wide")
+try:
+    from google import genai  # pip install google-genai
+    from google.genai import types as genai_types
+    GEMINI_AVAILABLE = True
+except Exception:
+    GEMINI_AVAILABLE = False
 
-TTS_MODEL_ID = "gemini-2.5-flash-preview-tts"
-TEXT_MODEL_ID = "gemini-2.0-flash"
 
 # ============================================================
-# 辅助函数
+# App config
+# ============================================================
+st.set_page_config(page_title="EPUB Web Reader", layout="wide")
+
+
+# ============================================================
+# Helpers
 # ============================================================
 def normalize_zip_path(path: str) -> str:
     path = (path or "").replace("\\", "/")
     path = re.sub(r"^\./", "", path)
     return posixpath.normpath(path)
 
+
 def resolve_href(base_dir: str, href: str):
     href = (href or "").strip()
-    if not href: return None, ""
-    if re.match(r"^[a-zA-Z]+://", href): return None, ""
+    if not href:
+        return None, ""
+    if re.match(r"^[a-zA-Z]+://", href):
+        return None, ""
     href_no_frag = href.split("#", 1)[0].split("?", 1)[0]
     fragment = href.split("#", 1)[1] if "#" in href else ""
     target = normalize_zip_path(posixpath.join(base_dir, href_no_frag))
     return target, fragment
 
+
 def decode_bytes(b: bytes) -> str:
     for enc in ("utf-8", "utf-8-sig", "gb18030", "utf-16"):
-        try: return b.decode(enc)
-        except UnicodeDecodeError: continue
+        try:
+            return b.decode(enc)
+        except UnicodeDecodeError:
+            continue
     return b.decode("latin-1", errors="ignore")
 
+
+def guess_mime(path: str) -> str:
+    ext = path.lower().rsplit(".", 1)[-1] if "." in path else ""
+    return {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "gif": "image/gif",
+        "svg": "image/svg+xml",
+        "webp": "image/webp",
+        "css": "text/css",
+    }.get(ext, "application/octet-stream")
+
+
 def soup_html(html: str) -> BeautifulSoup:
-    try: return BeautifulSoup(html, "lxml")
-    except: return BeautifulSoup(html, "html.parser")
+    try:
+        return BeautifulSoup(html, "lxml")
+    except Exception:
+        return BeautifulSoup(html, "html.parser")
+
 
 def first_child_text(parent, tag_suffix: str):
-    if parent is None: return None
+    if parent is None:
+        return None
     for el in parent.iter():
         if isinstance(el.tag, str) and el.tag.endswith(tag_suffix):
-            if el.text and el.text.strip(): return el.text.strip()
+            if el.text and el.text.strip():
+                return el.text.strip()
     return None
+
+
+def run_coro(coro):
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        out = {}
+
+        def runner():
+            out["value"] = asyncio.run(coro)
+
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+        t.join()
+        return out.get("value")
+
 
 def get_secret(*names: str) -> str:
     for n in names:
@@ -78,442 +128,1028 @@ def get_secret(*names: str) -> str:
             return str(os.environ.get(n)).strip()
     return ""
 
+
+def get_query_params():
+    try:
+        return dict(st.query_params)
+    except Exception:
+        return st.experimental_get_query_params()
+
+
+def set_query_params(**kwargs):
+    try:
+        st.query_params.clear()
+        for k, v in kwargs.items():
+            st.query_params[k] = v
+    except Exception:
+        st.experimental_set_query_params(**kwargs)
+
+
 # ============================================================
-# EPUB 解析
+# TOC parsing
 # ============================================================
 def parse_nav_toc(z: zipfile.ZipFile, nav_path: str):
-    try:
-        html = decode_bytes(z.read(nav_path))
-        soup = soup_html(html)
-        nav = soup.find("nav", attrs={"epub:type": "toc"}) or soup.find("nav", attrs={"role": "doc-toc"})
-        if not nav:
-            for cand in soup.find_all("nav"):
-                if "toc" in str(cand.get("epub:type") or cand.get("type") or "").lower():
-                    nav = cand
-                    break
-        toc_dir = posixpath.dirname(nav_path)
-        entries = []
-        if nav:
-            for a in nav.select("a[href]"):
-                title = a.get_text(" ", strip=True) or "Untitled"
-                href = a.get("href", "")
-                path, frag = resolve_href(toc_dir, href)
-                if path: entries.append({"title": title, "path": path})
-        return entries
-    except:
-        return []
+    html = decode_bytes(z.read(nav_path))
+    soup = soup_html(html)
+
+    nav = soup.find("nav", attrs={"epub:type": "toc"}) or soup.find("nav", attrs={"role": "doc-toc"})
+    if not nav:
+        for cand in soup.find_all("nav"):
+            t = cand.get("epub:type") or cand.get("type") or ""
+            if "toc" in str(t).lower():
+                nav = cand
+                break
+
+    toc_dir = posixpath.dirname(nav_path)
+    entries = []
+    if nav:
+        for a in nav.select("a[href]"):
+            title = a.get_text(" ", strip=True) or "Untitled"
+            href = a.get("href", "")
+            path, frag = resolve_href(toc_dir, href)
+            if path:
+                entries.append({"title": title, "href": href, "path": path, "fragment": frag})
+    return entries
+
 
 def parse_ncx_toc(z: zipfile.ZipFile, ncx_path: str):
-    try:
-        root = ET.fromstring(z.read(ncx_path))
-        toc_dir = posixpath.dirname(ncx_path)
-        entries = []
-        def walk(node):
-            for child in list(node):
-                if isinstance(child.tag, str) and child.tag.endswith("navPoint"):
-                    title, src = None, None
-                    for el in child.iter():
-                        if not title and isinstance(el.tag, str) and el.tag.endswith("text"):
-                            if el.text and el.text.strip(): title = el.text.strip()
-                        if not src and isinstance(el.tag, str) and el.tag.endswith("content"):
-                            src = el.attrib.get("src")
-                    if src:
-                        path, frag = resolve_href(toc_dir, src)
-                        if path: entries.append({"title": title or "Untitled", "path": path})
-                    walk(child)
-        navmap = next((e for e in root.iter() if isinstance(e.tag, str) and e.tag.endswith("navMap")), root)
-        walk(navmap)
-        return entries
-    except:
-        return []
+    root = ET.fromstring(z.read(ncx_path))
+    toc_dir = posixpath.dirname(ncx_path)
+    entries = []
 
+    def walk(node):
+        for child in list(node):
+            if isinstance(child.tag, str) and child.tag.endswith("navPoint"):
+                title = None
+                src = None
+                for el in child.iter():
+                    if title is None and isinstance(el.tag, str) and el.tag.endswith("text"):
+                        if el.text and el.text.strip():
+                            title = el.text.strip()
+                    if src is None and isinstance(el.tag, str) and el.tag.endswith("content"):
+                        src = el.attrib.get("src")
+                if src:
+                    path, frag = resolve_href(toc_dir, src)
+                    if path:
+                        entries.append({"title": title or "Untitled", "href": src, "path": path, "fragment": frag})
+                walk(child)
+
+    navmap = next((e for e in root.iter() if isinstance(e.tag, str) and e.tag.endswith("navMap")), root)
+    walk(navmap)
+    return entries
+
+
+# ============================================================
+# EPUB parsing (DRM-free)
+# ============================================================
 @st.cache_data(show_spinner=False)
 def parse_epub(epub_bytes: bytes):
     z = zipfile.ZipFile(io.BytesIO(epub_bytes))
     file_list = set(z.namelist())
 
     if "META-INF/container.xml" not in file_list:
-        raise ValueError("无效文件：缺少 container.xml")
+        raise ValueError("EPUB 缺少 META-INF/container.xml，文件可能损坏或不是标准 EPUB。")
 
-    container = ET.fromstring(z.read("META-INF/container.xml"))
-    opf_path = next((el.attrib.get("full-path") for el in container.iter() if el.tag.endswith("rootfile")), None)
-    if not opf_path: raise ValueError("无法找到 OPF")
-    
+    container_root = ET.fromstring(z.read("META-INF/container.xml"))
+    opf_path = None
+    for el in container_root.iter():
+        if isinstance(el.tag, str) and el.tag.endswith("rootfile"):
+            opf_path = el.attrib.get("full-path")
+            break
+    if not opf_path:
+        raise ValueError("无法在 container.xml 中找到 rootfile (OPF)。")
+
     opf_path = normalize_zip_path(opf_path)
+    if opf_path not in file_list:
+        raise ValueError(f"OPF 文件不存在：{opf_path}")
+
     opf_dir = posixpath.dirname(opf_path)
     opf_root = ET.fromstring(z.read(opf_path))
-    
-    # Metadata
-    metadata = next((e for e in opf_root.iter() if e.tag.endswith("metadata")), None)
-    title = first_child_text(metadata, "title") or "Untitled"
-    
-    # Manifest
+
+    metadata_el = next((e for e in opf_root.iter() if isinstance(e.tag, str) and e.tag.endswith("metadata")), None)
+    title = first_child_text(metadata_el, "title") or "Untitled"
+    creator = first_child_text(metadata_el, "creator") or ""
+    language = first_child_text(metadata_el, "language") or ""
+
+    manifest_el = next((e for e in opf_root.iter() if isinstance(e.tag, str) and e.tag.endswith("manifest")), None)
     manifest = {}
-    manifest_el = next((e for e in opf_root.iter() if e.tag.endswith("manifest")), None)
     if manifest_el is not None:
         for item in list(manifest_el):
-            if item.tag.endswith("item"):
-                iid, href = item.attrib.get("id"), item.attrib.get("href")
-                media_type = item.attrib.get("media-type", "")
-                props = item.attrib.get("properties", "")
-                if iid and href:
-                    path = normalize_zip_path(posixpath.join(opf_dir, href))
-                    manifest[iid] = {"href": href, "path": path, "media_type": media_type, "properties": props}
+            if not (isinstance(item.tag, str) and item.tag.endswith("item")):
+                continue
+            iid = item.attrib.get("id")
+            href = item.attrib.get("href")
+            media_type = item.attrib.get("media-type", "")
+            props = item.attrib.get("properties", "")
+            if not iid or not href:
+                continue
+            path = normalize_zip_path(posixpath.join(opf_dir, href))
+            manifest[iid] = {"id": iid, "href": href, "path": path, "media_type": media_type, "properties": props}
 
-    # Spine
-    spine_el = next((e for e in opf_root.iter() if e.tag.endswith("spine")), None)
-    spine_paths = []
+    mime_by_path = {m["path"]: (m.get("media_type") or "") for m in manifest.values()}
+
+    spine_el = next((e for e in opf_root.iter() if isinstance(e.tag, str) and e.tag.endswith("spine")), None)
+    spine_idrefs = []
     ncx_id = spine_el.attrib.get("toc") if spine_el is not None else None
-    
     if spine_el is not None:
         for itemref in list(spine_el):
-            if itemref.tag.endswith("itemref"):
+            if isinstance(itemref.tag, str) and itemref.tag.endswith("itemref"):
                 idref = itemref.attrib.get("idref")
-                if idref in manifest:
-                    m = manifest[idref]
-                    if "html" in (m.get("media_type") or "").lower() and m["path"] in file_list:
-                        spine_paths.append(m["path"])
+                if idref:
+                    spine_idrefs.append(idref)
 
-    # Try Parse TOC
-    nav_path = next((m["path"] for m in manifest.values() if "nav" in (m.get("properties") or "").split()), None)
-    ncx_path = manifest[ncx_id]["path"] if ncx_id and ncx_id in manifest else None
-    
+    def is_doc(media_type: str) -> bool:
+        mt = (media_type or "").lower()
+        return ("xhtml" in mt) or ("html" in mt)
+
+    spine_paths = []
+    for idref in spine_idrefs:
+        m = manifest.get(idref)
+        if m and is_doc(m.get("media_type", "")):
+            p = m["path"]
+            if p in file_list:
+                spine_paths.append(p)
+
+    if not spine_paths:
+        raise ValueError("未能从 spine 中解析到可阅读章节（可能是非常规 EPUB 或受保护文件）。")
+
+    cover_path = None
+    for m in manifest.values():
+        props = (m.get("properties") or "").split()
+        if "cover-image" in props and (m.get("media_type") or "").startswith("image/"):
+            cover_path = m["path"]
+            break
+    if cover_path and cover_path not in file_list:
+        cover_path = None
+
+    nav_path = None
+    for m in manifest.values():
+        if "nav" in (m.get("properties") or "").split():
+            nav_path = m["path"]
+            break
+    ncx_path = None
+    if ncx_id and ncx_id in manifest:
+        ncx_path = manifest[ncx_id]["path"]
+    if not ncx_path:
+        for m in manifest.values():
+            mt = (m.get("media_type") or "").lower()
+            if "dtbncx" in mt or (m.get("href", "").lower().endswith(".ncx")):
+                ncx_path = m["path"]
+                break
+
     toc_entries = []
-    if nav_path and nav_path in file_list: toc_entries = parse_nav_toc(z, nav_path)
-    elif ncx_path and ncx_path in file_list: toc_entries = parse_ncx_toc(z, ncx_path)
-    
-    # Map TOC to chapters
-    chapter_titles = [f"第 {i+1} 章" for i in range(len(spine_paths))]
-    path_to_idx = {p: i for i, p in enumerate(spine_paths)}
-    
+    if nav_path and nav_path in file_list:
+        toc_entries = parse_nav_toc(z, nav_path)
+    elif ncx_path and ncx_path in file_list:
+        toc_entries = parse_ncx_toc(z, ncx_path)
+
+    path_to_index = {p: i for i, p in enumerate(spine_paths)}
+    chapter_titles = [None] * len(spine_paths)
     for e in toc_entries:
-        if e["path"] in path_to_idx:
-            idx = path_to_idx[e["path"]]
-            chapter_titles[idx] = e["title"]
+        p = e.get("path")
+        if p in path_to_index:
+            idx = path_to_index[p]
+            if not chapter_titles[idx]:
+                chapter_titles[idx] = e.get("title") or None
+    for i in range(len(chapter_titles)):
+        if not chapter_titles[i]:
+            chapter_titles[i] = f"第 {i+1} 章"
 
     return {
         "title": title,
+        "creator": creator,
+        "language": language,
         "spine_paths": spine_paths,
         "chapter_titles": chapter_titles,
-        "mime_by_path": {m["path"]: m.get("media_type") for m in manifest.values()},
-        "file_list": file_list
+        "mime_by_path": mime_by_path,
+        "cover_path": cover_path,
+        "file_list": file_list,
     }
 
-def extract_chapter_blocks(epub_bytes: bytes, book: dict, chapter_idx: int, embed_images: bool):
+
+# ============================================================
+# Chapter extraction
+# ============================================================
+def embed_images_in_body(body, chapter_path: str, z: zipfile.ZipFile, mime_by_path: dict, file_list: set, max_images: int = 300):
+    base_dir = posixpath.dirname(chapter_path)
+    count = 0
+    for img in body.find_all("img"):
+        if count >= max_images:
+            break
+        src = img.get("src")
+        if not src:
+            continue
+        target, _frag = resolve_href(base_dir, src)
+        if not target or target not in file_list:
+            continue
+        raw = z.read(target)
+        mime = mime_by_path.get(target) or guess_mime(target)
+        b64 = base64.b64encode(raw).decode("ascii")
+        img["src"] = f"data:{mime};base64,{b64}"
+        count += 1
+
+
+def extract_chapter_text_and_html(epub_bytes: bytes, book: dict, chapter_idx: int, embed_images: bool):
     z = zipfile.ZipFile(io.BytesIO(epub_bytes))
-    path = book["spine_paths"][chapter_idx]
-    html = decode_bytes(z.read(path))
+    chapter_path = book["spine_paths"][chapter_idx]
+    raw = z.read(chapter_path)
+    html = decode_bytes(raw)
+
     soup = soup_html(html)
     body = soup.body or soup
-    for s in body.find_all("script"): s.decompose()
-    
+    for s in body.find_all("script"):
+        s.decompose()
+
+    text = body.get_text("\n", strip=True)
+
     if embed_images:
-        base_dir = posixpath.dirname(path)
-        for img in body.find_all("img"):
-            src = img.get("src")
-            target, _ = resolve_href(base_dir, src)
-            if target in book["file_list"]:
-                raw = z.read(target)
-                mime = book["mime_by_path"].get(target, "image/jpeg")
-                b64 = base64.b64encode(raw).decode("ascii")
-                img["src"] = f"data:{mime};base64,{b64}"
+        embed_images_in_body(body, chapter_path, z, book["mime_by_path"], book["file_list"])
+    body_html = "".join(str(x) for x in body.contents)
+    return text, body_html
+
+
+def extract_chapter_blocks(epub_bytes: bytes, book: dict, chapter_idx: int):
+    z = zipfile.ZipFile(io.BytesIO(epub_bytes))
+    chapter_path = book["spine_paths"][chapter_idx]
+    html = decode_bytes(z.read(chapter_path))
+    soup = soup_html(html)
+    body = soup.body or soup
+    for s in body.find_all("script"):
+        s.decompose()
 
     blocks = []
-    for el in body.find_all(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "div"]):
-        text = el.get_text(" ", strip=True)
-        # 只取有内容的块，且不取仅仅包含图片的块(除非有alt)
-        if len(text) > 1:
-            if el.find(["p", "div", "li", "h1", "h2"]): continue # 简单防嵌套
-            blocks.append({
-                "text": text,
-                "html": str(el), # 保留 HTML 标签
-                "tag": el.name
-            })
-            
+    for el in body.find_all(["p", "li", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6"]):
+        txt = el.get_text(" ", strip=True)
+        if txt:
+            blocks.append({"text": txt, "html": str(el)})
+
     if not blocks:
         txt = body.get_text("\n", strip=True)
-        parts = [p for p in txt.split('\n') if p.strip()]
-        for p in parts:
-            blocks.append({"text": p, "html": f"<p>{p}</p>", "tag": "p"})
-            
+        parts = [p.strip() for p in re.split(r"\n{2,}", txt) if p.strip()]
+        blocks = [{"text": p, "html": f"<p>{p}</p>"} for p in parts]
     return blocks
 
+
+def paginate_blocks(blocks, per_page: int):
+    return [blocks[i:i + per_page] for i in range(0, len(blocks), per_page)]
+
+
 # ============================================================
-# AI 核心
+# HTML wrapper (Reader)
 # ============================================================
-def pcm16_to_wav_bytes(pcm: bytes, rate: int = 24000) -> bytes:
+def wrap_reader_html(body_html: str, font_size: int, line_height: float, max_width: int, theme: str,
+                     tts_mode: str, speech_lang: str):
+    if theme == "Dark":
+        bg = "#0f1115"
+        fg = "#e6e6e6"
+        subtle = "#b6b6b6"
+        panel = "rgba(255,255,255,.06)"
+        border = "rgba(255,255,255,.14)"
+    else:
+        bg = "#ffffff"
+        fg = "#111111"
+        subtle = "#555555"
+        panel = "rgba(0,0,0,.04)"
+        border = "rgba(0,0,0,.12)"
+
+    tts_toolbar = ""
+    tts_script = ""
+    top_padding = "24px"
+
+    if tts_mode == "webspeech":
+        top_padding = "72px"
+        tts_toolbar = f"""
+        <div class="ttsbar">
+          <div class="row">
+            <button id="ttsStartTop">从本章开头朗读</button>
+            <button id="ttsStartSel">从选区/光标处朗读</button>
+            <button id="ttsPause">暂停</button>
+            <button id="ttsResume">继续</button>
+            <button id="ttsStop">停止</button>
+          </div>
+          <div class="row">
+            <label>语速</label>
+            <input id="ttsRate" type="range" min="0.6" max="1.4" step="0.05" value="1.0"/>
+            <span id="ttsRateVal">1.00</span>
+            <label style="margin-left:14px;">声音</label>
+            <select id="ttsVoice"></select>
+            <span class="tip">提示：直接点击任意段落即可从该段开始读</span>
+          </div>
+        </div>
+        """
+
+        tts_script = f"""
+        <script>
+        (function() {{
+          const LANG = {json.dumps(speech_lang)};
+          function $(id) {{ return document.getElementById(id); }}
+          const rate = $("ttsRate");
+          const rateVal = $("ttsRateVal");
+          const voiceSel = $("ttsVoice");
+
+          rate.addEventListener("input", () => {{
+            rateVal.textContent = Number(rate.value).toFixed(2);
+          }});
+
+          function collectSpeakables() {{
+            const nodes = Array.from(document.querySelectorAll(
+              ".reader p, .reader li, .reader blockquote, .reader h1, .reader h2, .reader h3, .reader h4, .reader h5, .reader h6"
+            ));
+            const speakables = nodes
+              .map(n => ({{ el: n, text: (n.innerText || "").trim() }}))
+              .filter(x => x.text.length > 0);
+
+            speakables.forEach((x, i) => {{
+              x.el.dataset.ttsIndex = String(i);
+              x.el.classList.add("tts-clickable");
+              x.el.addEventListener("click", (evt) => {{
+                if (evt.target && evt.target.closest && evt.target.closest("a")) return;
+                startFrom(i);
+              }});
+            }});
+            return speakables;
+          }}
+
+          let speakables = collectSpeakables();
+          let speaking = false;
+
+          function clearHighlight() {{
+            document.querySelectorAll(".tts-speaking").forEach(n => n.classList.remove("tts-speaking"));
+          }}
+          function highlight(i) {{
+            clearHighlight();
+            const el = speakables[i]?.el;
+            if (!el) return;
+            el.classList.add("tts-speaking");
+            el.scrollIntoView({{ block: "center", behavior: "smooth" }});
+          }}
+
+          function loadVoices() {{
+            const voices = speechSynthesis.getVoices() || [];
+            const filtered = voices.filter(v => (v.lang || "").toLowerCase().startsWith(LANG.toLowerCase()));
+            const list = (filtered.length ? filtered : voices);
+
+            voiceSel.innerHTML = "";
+            list.forEach(v => {{
+              const opt = document.createElement("option");
+              opt.value = v.name;
+              opt.textContent = `${{v.name}} (${{v.lang}})`;
+              voiceSel.appendChild(opt);
+            }});
+          }}
+          speechSynthesis.onvoiceschanged = loadVoices;
+          loadVoices();
+
+          function getSelectedVoice() {{
+            const name = voiceSel.value;
+            const voices = speechSynthesis.getVoices() || [];
+            return voices.find(v => v.name === name) || null;
+          }}
+
+          function stopAll() {{
+            speechSynthesis.cancel();
+            speaking = false;
+            clearHighlight();
+          }}
+
+          function speakOne(i) {{
+            if (i >= speakables.length) {{
+              stopAll();
+              return;
+            }}
+            speaking = true;
+            highlight(i);
+
+            const u = new SpeechSynthesisUtterance(speakables[i].text);
+            u.lang = LANG;
+            u.rate = Number(rate.value);
+
+            const v = getSelectedVoice();
+            if (v) u.voice = v;
+
+            u.onend = () => {{
+              if (!speaking) return;
+              speakOne(i + 1);
+            }};
+            u.onerror = () => {{
+              if (!speaking) return;
+              speakOne(i + 1);
+            }};
+            speechSynthesis.speak(u);
+          }}
+
+          function startFrom(i) {{
+            stopAll();
+            speakOne(i);
+          }}
+
+          function startFromSelection() {{
+            const sel = window.getSelection();
+            if (!sel || sel.rangeCount === 0) return;
+            let node = sel.anchorNode;
+            if (!node) return;
+            if (node.nodeType === 3) node = node.parentElement;
+            while (node && !node.dataset.ttsIndex) node = node.parentElement;
+            if (!node) return;
+            const idx = parseInt(node.dataset.ttsIndex, 10);
+            if (!isNaN(idx)) startFrom(idx);
+          }}
+
+          $("ttsStartTop").addEventListener("click", () => startFrom(0));
+          $("ttsStartSel").addEventListener("click", () => startFromSelection());
+          $("ttsPause").addEventListener("click", () => speechSynthesis.pause());
+          $("ttsResume").addEventListener("click", () => speechSynthesis.resume());
+          $("ttsStop").addEventListener("click", () => stopAll());
+
+          window.addEventListener("load", () => {{
+            speakables = collectSpeakables();
+          }});
+        }})();
+        </script>
+        """
+
+    if tts_mode == "gemini":
+        top_padding = "60px"
+        tts_toolbar = f"""
+        <div class="ttsbar">
+          <div class="row">
+            <span class="tip">Gemini 朗读：点击段落可设定朗读起点（会刷新页面并记忆位置）</span>
+          </div>
+        </div>
+        """
+
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  body {{
+    background: {bg};
+    color: {fg};
+    margin: 0;
+    padding: 0;
+    font-size: {font_size}px;
+    line-height: {line_height};
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif;
+  }}
+  .reader {{
+    max-width: {max_width}px;
+    margin: 0 auto;
+    padding: {top_padding} 18px 64px 18px;
+    word-wrap: break-word;
+    overflow-wrap: anywhere;
+  }}
+  img {{ max-width: 100%; height: auto; }}
+  a {{ color: inherit; text-decoration: underline; }}
+  .tts-link {{ text-decoration: none; color: inherit; display: block; }}
+  .tts-link:hover {{ background: rgba(127,127,127,.08); border-radius: 8px; }}
+  .tts-current {{ outline: 2px solid rgba(255, 80, 80, .55); outline-offset: 3px; border-radius: 8px; }}
+  hr {{ border: none; border-top: 1px solid rgba(127,127,127,.35); }}
+  blockquote {{
+    margin: 16px 0;
+    padding: 10px 14px;
+    border-left: 3px solid rgba(127,127,127,.6);
+    color: {subtle};
+    background: rgba(127,127,127,.08);
+  }}
+
+  .ttsbar {{
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    backdrop-filter: blur(8px);
+    background: {panel};
+    border-bottom: 1px solid {border};
+    padding: 10px 12px;
+    z-index: 9999;
+    font-size: 14px;
+  }}
+  .ttsbar .row {{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin: 6px 0;
+  }}
+  .ttsbar button {{
+    padding: 6px 10px;
+    border: 1px solid {border};
+    background: transparent;
+    color: {fg};
+    border-radius: 6px;
+    cursor: pointer;
+  }}
+  .ttsbar select {{
+    padding: 6px 8px;
+    border: 1px solid {border};
+    background: transparent;
+    color: {fg};
+    border-radius: 6px;
+  }}
+  .ttsbar input[type="range"] {{
+    width: 180px;
+  }}
+  .ttsbar .tip {{
+    margin-left: 10px;
+    color: {subtle};
+    text-decoration: none;
+  }}
+
+  .tts-clickable {{
+    cursor: pointer;
+  }}
+  .tts-speaking {{
+    outline: 2px solid rgba(255, 80, 80, .55);
+    outline-offset: 3px;
+    border-radius: 6px;
+  }}
+</style>
+</head>
+<body>
+  {tts_toolbar}
+  <div class="reader">{body_html}</div>
+  {tts_script}
+</body>
+</html>"""
+
+
+def build_gemini_clickable_body(blocks, current_idx: int | None):
+    out = []
+    for i, b in enumerate(blocks):
+        cls = "tts-link"
+        if current_idx is not None and i == current_idx:
+            cls += " tts-current"
+        out.append(f'<a class="{cls}" target="_top" href="?tts_start={i}">{b["html"]}</a>')
+    return "\n".join(out)
+
+
+# ============================================================
+# Gemini TTS helpers (WAV)
+# ============================================================
+def pcm16_to_wav_bytes(pcm: bytes, rate: int = 24000, channels: int = 1, sample_width: int = 2) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
+        wf.setnchannels(channels)
+        wf.setsampwidth(sample_width)
         wf.setframerate(rate)
         wf.writeframes(pcm)
     return buf.getvalue()
 
-@st.cache_data(show_spinner=False)
-def gemini_translate(text: str, style: str) -> str:
-    if not GEMINI_AVAILABLE: return "Error: 库未安装"
-    api_key = get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY")
-    client = genai.Client(api_key=api_key)
-    prompt = f"Translate the following text to Simplified Chinese.\nStyle: {style}\n\n{text}"
-    try:
-        resp = client.models.generate_content(model=TEXT_MODEL_ID, contents=prompt)
-        return resp.text.strip()
-    except Exception as e:
-        return f"翻译出错: {str(e)}"
 
 @st.cache_data(show_spinner=False)
-def gemini_tts(text: str, voice: str) -> bytes:
-    if not GEMINI_AVAILABLE: return b""
+def gemini_tts_wav(text: str, voice_name: str, model: str, style: str = "") -> bytes:
+    if not GEMINI_AVAILABLE:
+        raise RuntimeError("google-genai 未安装")
+
     api_key = get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY")
-    client = genai.Client(api_key=api_key)
-    try:
-        resp = client.models.generate_content(
-            model=TTS_MODEL_ID,
-            contents=text[:4000],
-            config=genai_types.GenerateContentConfig(
-                response_modalities=["AUDIO"],
-                speech_config=genai_types.SpeechConfig(
-                    voice_config=genai_types.VoiceConfig(
-                        prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(voice_name=voice)
+    client = genai.Client(api_key=api_key) if api_key else genai.Client()
+
+    contents = text if not style.strip() else f"{style.strip()}\n\n{text}"
+
+    resp = client.models.generate_content(
+        model=model,
+        contents=contents,
+        config=genai_types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=genai_types.SpeechConfig(
+                voice_config=genai_types.VoiceConfig(
+                    prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(
+                        voice_name=voice_name
                     )
                 )
             )
         )
-        data = resp.candidates[0].content.parts[0].inline_data.data
-        pcm = base64.b64decode(data) if isinstance(data, str) else data
-        return pcm16_to_wav_bytes(pcm)
-    except Exception as e:
-        print(f"TTS Error: {e}")
-        return b""
+    )
+
+    data = resp.candidates[0].content.parts[0].inline_data.data
+    if isinstance(data, str):
+        pcm = base64.b64decode(data)
+    else:
+        pcm = data
+    return pcm16_to_wav_bytes(pcm, rate=24000)
+
+
+# ============================================================
+# Translation helpers (kept)
+# ============================================================
+@st.cache_data(show_spinner=False)
+def translate_en_to_zh_openai(text: str, model: str) -> str:
+    if not OPENAI_AVAILABLE:
+        raise RuntimeError("openai 未安装")
+    client = OpenAI()
+    prompt = (
+        "请把下面英文翻译成简体中文。\n"
+        "要求：\n"
+        "1) 尽量逐段对应（保留段落换行）。\n"
+        "2) 不要添加解释、注释或多余内容。\n"
+        "3) 保持人名/地名一致。\n"
+        "4) 语气自然，保留原文风格。\n\n"
+        f"{text}"
+    )
+    resp = client.responses.create(model=model, input=prompt)
+    return resp.output_text.strip()
+
 
 @st.cache_data(show_spinner=False)
-def translate_en_to_zh_openai(text: str) -> str:
-    if not OPENAI_AVAILABLE: return "Error: openai not installed."
-    client = OpenAI()
-    prompt = f"Translate to Simplified Chinese. Keep paragraphs.\n\n{text}"
-    try:
-        resp = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}])
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        return f"OpenAI Error: {e}"
+def translate_en_to_zh_gemini(text: str, model: str = "gemini-2.0-flash", style: str = "", max_retries: int = 1) -> str:
+    if not GEMINI_AVAILABLE:
+        raise RuntimeError("google-genai 未安装")
+    api_key = get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY")
+    client = genai.Client(api_key=api_key) if api_key else genai.Client()
 
-# ============================================================
-# UI 渲染 (修复缩进问题)
-# ============================================================
-def render_clickable_blocks(blocks, current_play_idx, theme):
-    text_color = "#e6e6e6" if theme == "Dark" else "#111111"
-    hover_bg = "rgba(255,255,255,0.1)" if theme == "Dark" else "rgba(0,0,0,0.05)"
-    active_bg = "rgba(255, 200, 100, 0.3)" if theme == "Dark" else "rgba(255, 230, 0, 0.4)"
-    
-    # CSS: 定义链接样式，使其看起来像块级元素
-    css = f"""
-    <style>
-    .block-link {{
-        display: block !important;
-        text-decoration: none !important;
-        color: {text_color} !important;
-        padding: 6px 10px;
-        margin-bottom: 8px;
-        border-radius: 4px;
-        border-left: 3px solid transparent;
-        transition: background 0.1s;
-    }}
-    .block-link:hover {{
-        background-color: {hover_bg};
-        border-left: 3px solid #888;
-    }}
-    .block-active {{
-        background-color: {active_bg} !important;
-        border-left: 3px solid #f60 !important;
-    }}
-    /* 让原有的 p 标签样式不干扰链接 */
-    .block-link p, .block-link div, .block-link h1, .block-link h2 {{
-        margin: 0; padding: 0; color: inherit;
-    }}
-    </style>
-    """
-    
-    html_list = [css]
-    
-    for i, block in enumerate(blocks):
-        active_class = "block-active" if i == current_play_idx else ""
-        content = block["html"].strip()
-        # 核心修复：单行拼接，无缩进，避免 Markdown 识别为代码块
-        link = f'<a href="?play_idx={i}" target="_self" class="block-link {active_class}" id="blk-{i}">{content}</a>'
-        html_list.append(link)
-        
-    return "".join(html_list)
+    prompt = (
+        "请把下面英文翻译成简体中文。\n"
+        "要求：\n"
+        "1) 尽量逐段对应（保留段落换行）。\n"
+        "2) 不要添加解释、注释或多余内容。\n"
+        "3) 保持人名/地名一致。\n"
+        "4) 语气自然，保留原文风格。\n"
+    )
+    if style.strip():
+        prompt += f"\n额外风格要求：{style.strip()}\n"
+    prompt += "\n---\n" + text
 
-# ============================================================
-# Main
-# ============================================================
-def main():
-    query = st.query_params
-    play_idx_str = query.get("play_idx", None)
-    current_play_idx = int(play_idx_str) if play_idx_str is not None else None
-
-    with st.sidebar:
-        st.header("📖 EPUB AI Reader")
-        uploaded = st.file_uploader("上传文件", type=["epub"])
-        
-        st.divider()
-        st.subheader("🔊 朗读 (Gemini)")
-        voice = st.selectbox("声音", ["Kore", "Zephyr", "Puck", "Charon", "Fenrir"], index=0)
-        speed = st.slider("语速", 0.5, 2.0, 1.25, 0.1)
-        auto_next = st.checkbox("自动连播", value=True)
-        
-        st.divider()
-        st.subheader("🛠️ 设置")
-        view_mode = st.radio("模式", ["点击朗读", "对照翻译"], index=0)
-        if view_mode == "对照翻译":
-            trans_engine = st.radio("翻译引擎", ["Gemini", "OpenAI"], horizontal=True)
-        
-        theme = st.radio("主题", ["Light", "Dark"], index=1, horizontal=True)
-
-    if not uploaded:
-        st.info("👈 请在左侧上传 EPUB 文件。")
-        st.stop()
-        
-    # 解析
-    epub_bytes = uploaded.getvalue()
-    book_hash = hashlib.sha256(epub_bytes).hexdigest()
-    
-    if "book_hash" not in st.session_state or st.session_state.book_hash != book_hash:
+    last = None
+    for attempt in range(max_retries + 1):
         try:
-            st.session_state.book = parse_epub(epub_bytes)
-            st.session_state.book_hash = book_hash
-            st.session_state.chapter_idx = 0
-            st.query_params.clear()
+            resp = client.models.generate_content(model=model, contents=prompt)
+            out = getattr(resp, "text", None)
+            if out and out.strip():
+                return out.strip()
+            return resp.candidates[0].content.parts[0].text.strip()
         except Exception as e:
-            st.error(f"解析失败: {e}")
-            st.stop()
-            
-    book = st.session_state.book
-    
-    # 导航
-    col1, col2, col3 = st.columns([1, 4, 1])
-    with col1:
-        if st.button("⬅️ 上一章", use_container_width=True):
-            st.session_state.chapter_idx = max(0, st.session_state.chapter_idx - 1)
-            st.query_params.clear()
-            st.rerun()
-    with col2:
-        chap_list = book["chapter_titles"]
-        curr_idx = st.session_state.chapter_idx
-        # 确保索引不越界（防御性编程）
-        if curr_idx >= len(chap_list): curr_idx = 0
-        
-        new_chap = st.selectbox("章节", range(len(chap_list)), 
-                                index=curr_idx, 
-                                format_func=lambda i: chap_list[i], 
-                                label_visibility="collapsed")
-        if new_chap != curr_idx:
-            st.session_state.chapter_idx = new_chap
-            st.query_params.clear()
-            st.rerun()
-    with col3:
-        if st.button("下一章 ➡️", use_container_width=True):
-            st.session_state.chapter_idx = min(len(chap_list)-1, st.session_state.chapter_idx + 1)
-            st.query_params.clear()
-            st.rerun()
+            last = e
+            msg = str(e)
+            if ("429" in msg) or ("RESOURCE_EXHAUSTED" in msg):
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt * 2)
+                    continue
+                raise RuntimeError("Gemini 翻译配额/速率耗尽（429）。请稍后重试或切换到 OpenAI 翻译。") from e
+            raise
+    raise last
 
-    # 内容
-    blocks = extract_chapter_blocks(epub_bytes, book, st.session_state.chapter_idx, embed_images=True)
-    
-    # 音频播放
-    if current_play_idx is not None and 0 <= current_play_idx < len(blocks):
-        target_text = blocks[current_play_idx]["text"]
-        if target_text.strip():
-            wav = gemini_tts(target_text, voice)
-            if wav:
-                b64 = base64.b64encode(wav).decode()
-                next_js = ""
-                if auto_next and current_play_idx + 1 < len(blocks):
-                    next_url = f"?play_idx={current_play_idx + 1}"
-                    next_js = f"""
-                    aud.onended = function() {{
-                        window.parent.location.search = "{next_url}";
-                    }};
-                    """
-                
-                # 播放器组件
-                player_html = f"""
-                <div style="position:fixed; bottom:20px; left:50%; transform:translateX(-50%); 
-                            background:#222; padding:8px 15px; border-radius:30px; 
-                            box-shadow:0 5px 20px rgba(0,0,0,0.5); z-index:99999; display:flex; align-items:center; gap:10px;">
-                    <span style="color:#fff; font-size:14px; white-space:nowrap;">▶ ({current_play_idx + 1}/{len(blocks)})</span>
-                    <audio id="player" controls autoplay style="height:30px;">
-                        <source src="data:audio/wav;base64,{b64}" type="audio/wav">
-                    </audio>
-                </div>
-                <script>
-                    var aud = document.getElementById("player");
-                    aud.playbackRate = {speed};
-                    {next_js}
-                </script>
-                """
-                components.html(player_html, height=0)
 
-    # 视图渲染
-    if view_mode == "点击朗读":
-        st.caption("提示：点击段落即可朗读。")
-        html_content = render_clickable_blocks(blocks, current_play_idx, theme)
-        bg = "#0e1117" if theme == "Dark" else "#ffffff"
-        
-        # 修复：移除 f-string 内部的缩进，防止被当做代码块
-        st.markdown(f'<div style="background-color:{bg}; padding:20px; border-radius:8px; max-width:800px; margin:0 auto;">{html_content}</div>', unsafe_allow_html=True)
-        
-        # 滚动 JS
-        if current_play_idx is not None:
-             components.html(f"<script>setTimeout(function(){{var el=window.parent.document.getElementById('blk-{current_play_idx}');if(el)el.scrollIntoView({{behavior:'smooth',block:'center'}});}},500);</script>", height=0)
+# ============================================================
+# UI
+# ============================================================
+st.title("EPUB 在线阅读 + 在线朗读 + 对照翻译（Streamlit）")
 
-    else: # 翻译模式
-        st.caption("左侧点击段落可朗读，右侧点击按钮翻译。")
-        per_page = 10
-        total_pages = max(1, (len(blocks) + per_page - 1) // per_page)
-        page = st.number_input("页码", 1, total_pages, 1) - 1
-        
-        chunk = blocks[page*per_page : (page+1)*per_page]
-        
-        colL, colR = st.columns(2)
+with st.sidebar:
+    st.header("打开 EPUB")
+    uploaded = st.file_uploader("上传 EPUB（建议 DRM-free）", type=["epub"])
+
+    st.divider()
+    st.subheader("阅读设置")
+    theme = st.radio("主题", ["Light", "Dark"], horizontal=True, index=1)
+    font_size = st.slider("字号", 14, 28, 18, 1)
+    line_height = st.slider("行距", 1.2, 2.2, 1.7, 0.05)
+    max_width = st.slider("版心宽度（px）", 520, 1100, 780, 10)
+
+    view_mode = st.radio("显示模式", ["排版（HTML）", "纯文本", "对照翻译（英->中）"], index=0)
+    embed_images = st.checkbox("嵌入图片（有插图时更完整）", value=True)
+
+    st.divider()
+    st.subheader("在线朗读（主阅读声音）")
+    tts_mode = st.radio("朗读引擎", ["Gemini（Kore等）", "浏览器（系统语音）"], horizontal=False, index=0)
+    st.caption("Gemini：点击段落可设起点；停止后可从上次位置继续（不会遗忘）。")
+
+    st.divider()
+    st.caption("提示：仅用于你有合法权限阅读的 EPUB；DRM 书籍可能无法解析。")
+
+if not uploaded:
+    st.info("在左侧上传 EPUB 文件后即可开始阅读。")
+    st.stop()
+
+epub_bytes = uploaded.getvalue()
+book_hash = hashlib.sha256(epub_bytes).hexdigest()
+book = parse_epub(epub_bytes)
+
+if "book_hash" not in st.session_state or st.session_state.book_hash != book_hash:
+    st.session_state.book_hash = book_hash
+    st.session_state.chapter_idx = 0
+    st.session_state.page_idx = 0
+    st.session_state.g_tts_pos = 0
+
+qp = get_query_params()
+if "tts_start" in qp:
+    try:
+        raw = qp["tts_start"][0] if isinstance(qp["tts_start"], list) else qp["tts_start"]
+        idx = int(raw)
+        st.session_state.g_tts_pos = max(0, idx)
+    except Exception:
+        pass
+    set_query_params()
+
+meta_cols = st.columns([1, 4])
+with meta_cols[0]:
+    if book.get("cover_path"):
+        try:
+            ztmp = zipfile.ZipFile(io.BytesIO(epub_bytes))
+            cover_bytes = ztmp.read(book["cover_path"])
+            st.image(cover_bytes, use_container_width=True)
+        except Exception:
+            pass
+
+with meta_cols[1]:
+    st.subheader(book.get("title", "Untitled"))
+    if book.get("creator"):
+        st.write(book["creator"])
+    if book.get("language"):
+        st.caption(f"Language: {book['language']}")
+
+chapter_count = len(book["spine_paths"])
+labels = book["chapter_titles"]
+
+selected = st.sidebar.selectbox(
+    "目录（按章节顺序）",
+    options=list(range(chapter_count)),
+    index=st.session_state.chapter_idx,
+    format_func=lambda i: labels[i] if 0 <= i < len(labels) else f"第 {i + 1} 章",
+)
+if selected != st.session_state.chapter_idx:
+    st.session_state.chapter_idx = int(selected)
+    st.session_state.page_idx = 0
+    st.session_state.g_tts_pos = 0
+
+nav_cols = st.columns([1, 1, 6])
+with nav_cols[0]:
+    if st.button("上一章", disabled=(st.session_state.chapter_idx <= 0), use_container_width=True):
+        st.session_state.chapter_idx -= 1
+        st.session_state.page_idx = 0
+        st.session_state.g_tts_pos = 0
+        st.rerun()
+with nav_cols[1]:
+    if st.button("下一章", disabled=(st.session_state.chapter_idx >= chapter_count - 1), use_container_width=True):
+        st.session_state.chapter_idx += 1
+        st.session_state.page_idx = 0
+        st.session_state.g_tts_pos = 0
+        st.rerun()
+with nav_cols[2]:
+    st.markdown(f"### {labels[st.session_state.chapter_idx]}")
+
+chapter_text, chapter_body_html = extract_chapter_text_and_html(
+    epub_bytes=epub_bytes,
+    book=book,
+    chapter_idx=st.session_state.chapter_idx,
+    embed_images=(embed_images and view_mode == "排版（HTML）"),
+)
+
+# ============================================================
+# Main rendering
+# ============================================================
+if view_mode == "纯文本":
+    safe_text = chapter_text.replace("\n", "  \n")
+    st.markdown(safe_text)
+
+elif view_mode == "对照翻译（英->中）":
+    blocks = extract_chapter_blocks(epub_bytes, book, st.session_state.chapter_idx)
+    per_page = st.sidebar.slider("每页段落数（决定对照粒度）", 4, 18, 8, 1)
+    pages = paginate_blocks(blocks, per_page=per_page)
+
+    if not pages:
+        st.warning("本章无可分页内容。")
+    else:
+        max_page = len(pages)
+        page_idx = st.sidebar.slider("页", 1, max_page, min(max_page, st.session_state.page_idx + 1), 1) - 1
+        st.session_state.page_idx = int(page_idx)
+
+        page_blocks = pages[page_idx]
+        left_html = "".join(b["html"] for b in page_blocks)
+        src_text = "\n\n".join(b["text"] for b in page_blocks)
+
+        is_english = book.get("language", "").lower().startswith("en")
+        if not is_english:
+            ascii_ratio = sum(1 for c in src_text if ord(c) < 128) / max(1, len(src_text))
+            is_english = ascii_ratio > 0.7
+
+        colL, colR = st.columns(2, gap="large")
+
         with colL:
-            # 这里的左侧我们也用 render_clickable_blocks 渲染，支持点击朗读
-            # 但是要调整 index 偏移
-            # 我们需要造一个临时的 blocks 列表，但是 ID 必须对应全局 index
-            # render_clickable_blocks 内部是 enumerate(blocks)，所以我们不能直接传 chunk
-            # 而是要手动生成 HTML
-            
-            # 手动生成左侧 HTML
-            left_html_parts = []
-            # 引入样式
-            left_html_parts.append(render_clickable_blocks([], None, theme)) #只拿css
-            
-            for i, block in enumerate(chunk):
-                real_idx = page * per_page + i
-                active_class = "block-active" if real_idx == current_play_idx else ""
-                content = block["html"].strip()
-                link = f'<a href="?play_idx={real_idx}" target="_self" class="block-link {active_class}" id="blk-{real_idx}">{content}</a>'
-                left_html_parts.append(link)
-            
-            full_left = "".join(left_html_parts)
-            bg = "#0e1117" if theme == "Dark" else "#ffffff"
-            st.markdown(f'<div style="background-color:{bg}; padding:10px;">{full_left}</div>', unsafe_allow_html=True)
+            st.markdown("#### 原文")
+            full_html = wrap_reader_html(
+                body_html=left_html,
+                font_size=font_size,
+                line_height=line_height,
+                max_width=max_width,
+                theme=theme,
+                tts_mode="none",
+                speech_lang="en-US",
+            )
+            components.html(full_html, height=780, scrolling=True)
 
         with colR:
-            src_text = "\n\n".join([b["text"] for b in chunk])
-            if st.button("翻译当前页", key=f"btn_trans_{page}", use_container_width=True):
-                with st.spinner("翻译中..."):
-                    if trans_engine == "Gemini":
-                        res = gemini_translate(src_text, "文学流畅")
-                    else:
-                        res = translate_en_to_zh_openai(src_text)
-                st.session_state[f"trans_{page}"] = res
-            
-            if f"trans_{page}" in st.session_state:
-                st.info(st.session_state[f"trans_{page}"])
+            st.markdown("#### 中文翻译")
+            if not is_english:
+                st.info("检测到本页不像英文，未自动翻译。")
+                st.text_area("内容", src_text, height=780, key="not_en_text_area")
             else:
-                st.text_area("原文预览", src_text, height=600, disabled=True)
+                provider = st.radio("翻译引擎", ["Gemini", "OpenAI"], horizontal=True, index=0)
+                style = st.text_input("翻译风格（可选）", value="")
 
-if __name__ == "__main__":
-    main()
+                if provider == "Gemini":
+                    if not GEMINI_AVAILABLE:
+                        st.error("未安装 google-genai：请 pip install google-genai")
+                    else:
+                        gemini_model = st.text_input("Gemini 翻译模型", value="gemini-2.0-flash")
+                        if st.button("翻译当前页（Gemini）", use_container_width=True):
+                            try:
+                                with st.spinner("正在翻译（Gemini）…"):
+                                    zh = translate_en_to_zh_gemini(src_text, model=gemini_model, style=style)
+                                st.text_area("翻译结果（可复制）", zh, height=780, key="zh_gemini")
+                            except Exception as e:
+                                st.error(f"翻译失败：{e}")
+                                st.caption("检查：是否已设置 GEMINI_API_KEY / GOOGLE_API_KEY？以及配额是否足够。")
+                else:
+                    if not OPENAI_AVAILABLE:
+                        st.error("未安装 openai：请 pip install openai")
+                    else:
+                        openai_model = st.text_input("OpenAI 翻译模型", value="gpt-4o-mini")
+                        if st.button("翻译当前页（OpenAI）", use_container_width=True):
+                            try:
+                                with st.spinner("正在翻译（OpenAI）…"):
+                                    zh = translate_en_to_zh_openai(src_text, model=openai_model)
+                                st.text_area("翻译结果（可复制）", zh, height=780, key="zh_openai")
+                            except Exception as e:
+                                st.error(f"翻译失败：{e}")
+                                st.caption("检查：是否已设置 OPENAI_API_KEY？")
+
+else:
+    blocks = extract_chapter_blocks(epub_bytes, book, st.session_state.chapter_idx)
+    speech_lang = "en-US" if (book.get("language", "").lower().startswith("en")) else "zh-CN"
+
+    if tts_mode.startswith("Gemini"):
+        clickable_html = build_gemini_clickable_body(blocks, current_idx=st.session_state.g_tts_pos if blocks else None)
+        full_html = wrap_reader_html(
+            body_html=clickable_html if blocks else chapter_body_html,
+            font_size=font_size,
+            line_height=line_height,
+            max_width=max_width,
+            theme=theme,
+            tts_mode="gemini",
+            speech_lang=speech_lang,
+        )
+    else:
+        full_html = wrap_reader_html(
+            body_html=chapter_body_html,
+            font_size=font_size,
+            line_height=line_height,
+            max_width=max_width,
+            theme=theme,
+            tts_mode="webspeech",
+            speech_lang=speech_lang,
+        )
+
+    components.html(full_html, height=900, scrolling=True)
+
+# ============================================================
+# Gemini main reading controls (stateful position)
+# ============================================================
+if view_mode == "排版（HTML）" and tts_mode.startswith("Gemini"):
+    st.divider()
+    st.subheader("在线朗读（Gemini 主阅读声音）")
+
+    if not GEMINI_AVAILABLE:
+        st.error("未安装 google-genai：请 pip install google-genai")
+    else:
+        api_key_present = bool(get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY"))
+        if not api_key_present:
+            st.warning("未检测到 GEMINI_API_KEY/GOOGLE_API_KEY。请配置后再使用 Gemini 朗读。")
+
+        colA, colB, colC, colD = st.columns([2, 2, 2, 2])
+        with colA:
+            voice = st.selectbox("声音", ["Kore", "Zephyr", "Puck", "Charon", "Fenrir"], index=0)
+        with colB:
+            model = st.text_input("TTS 模型", value="gemini-2.5-flash-preview-tts")
+        with colC:
+            style = st.text_input("风格（可选）", value="请用温柔、自然、略慢的语气朗读：")
+        with colD:
+            chunk_blocks = st.number_input("每次朗读段落数", min_value=1, max_value=12, value=3, step=1)
+
+        blocks = extract_chapter_blocks(epub_bytes, book, st.session_state.chapter_idx)
+        total = len(blocks)
+
+        st.caption(
+            f"当前位置：第 {st.session_state.g_tts_pos + 1} 段 / 共 {total} 段。"
+            f"（点击正文段落可重设起点；停止后位置会被记住。）"
+        )
+
+        start = max(0, min(st.session_state.g_tts_pos, max(0, total - 1)))
+        end = min(total, start + int(chunk_blocks))
+        tts_text = "\n\n".join(b["text"] for b in blocks[start:end]) if blocks else ""
+
+        btn1, btn2, btn3 = st.columns(3)
+        with btn1:
+            play = st.button("播放这一段（从当前位置）", use_container_width=True)
+        with btn2:
+            prev = st.button("后退一段", use_container_width=True, disabled=(start <= 0))
+        with btn3:
+            nxt = st.button("前进一段", use_container_width=True, disabled=(end >= total))
+
+        if prev:
+            st.session_state.g_tts_pos = max(0, st.session_state.g_tts_pos - 1)
+            st.rerun()
+
+        if nxt:
+            st.session_state.g_tts_pos = min(max(0, total - 1), st.session_state.g_tts_pos + 1)
+            st.rerun()
+
+        if play:
+            if not tts_text.strip():
+                st.warning("没有可朗读文本。")
+            else:
+                try:
+                    with st.spinner("正在生成音频（WAV）…"):
+                        wav_bytes = gemini_tts_wav(tts_text, voice_name=voice, model=model, style=style)
+                    st.audio(wav_bytes, format="audio/wav")
+                except Exception as e:
+                    st.error(f"Gemini TTS 失败：{e}")
+                    st.caption("若出现 429 RESOURCE_EXHAUSTED：说明配额/速率耗尽，需要稍后重试或启用计费。")
+
+# ============================================================
+# Keep the existing optional blocks (unchanged)
+# ============================================================
+with st.expander("生成本章 MP3（Edge TTS，可下载）", expanded=False):
+    if not EDGE_TTS_AVAILABLE:
+        st.info("未安装 edge-tts：运行 `pip install edge-tts` 后重启 Streamlit。")
+    else:
+        tts_cols = st.columns([2, 2, 2, 2])
+        with tts_cols[0]:
+            voice = st.selectbox(
+                "中文声音（Edge TTS）",
+                options=[
+                    "zh-CN-XiaoxiaoNeural",
+                    "zh-CN-YunxiNeural",
+                    "zh-CN-YunyangNeural",
+                    "zh-CN-XiaoyiNeural",
+                    "zh-CN-liaoning-XiaobeiNeural",
+                    "zh-TW-HsiaoChenNeural",
+                    "zh-TW-YunJheNeural",
+                    "zh-HK-HiuMaanNeural",
+                ],
+                index=0,
+            )
+        with tts_cols[1]:
+            rate_pct = st.slider("语速（%）", -40, 40, 0, 5)
+        with tts_cols[2]:
+            pitch_hz = st.slider("音高（Hz）", -20, 20, 0, 1)
+        with tts_cols[3]:
+            vol_pct = st.slider("音量（%）", -20, 20, 0, 1)
+
+        max_chars = st.slider("单段最大字符（越小越稳）", 1500, 5000, 3000, 250)
+        rate = f"{rate_pct:+d}%"
+        pitch = f"{pitch_hz:+d}Hz"
+        volume = f"{vol_pct:+d}%"
+
+        if st.button("生成本章 MP3", use_container_width=True):
+            if not chapter_text.strip():
+                st.warning("本章内容为空或无法提取文本。")
+            else:
+                with st.spinner("正在生成音频…"):
+                    audio_bytes = run_coro(
+                        edge_tts_mp3_long(
+                            text=chapter_text,
+                            voice=voice,
+                            rate=rate,
+                            pitch=pitch,
+                            volume=volume,
+                            max_chars=max_chars,
+                        )
+                    )
+                st.audio(audio_bytes, format="audio/mp3")
+                safe_name = re.sub(r'[\\/:*?"<>|]+', "_", labels[st.session_state.chapter_idx])
+                filename = f"{book.get('title','book')}-{safe_name}.mp3"
+                st.download_button(
+                    "下载本章 MP3",
+                    data=audio_bytes,
+                    file_name=filename,
+                    mime="audio/mpeg",
+                    use_container_width=True,
+                )
+
+with st.expander("在线朗读（Google Gemini TTS：Kore 等，播放 WAV，不生成 MP3）", expanded=False):
+    if not GEMINI_AVAILABLE:
+        st.info("未安装 google-genai：运行 `pip install google-genai` 后重启。")
+    else:
+        voice = st.selectbox("Google 声音（预置）", ["Kore", "Zephyr", "Puck", "Charon", "Fenrir"], index=0, key="gemini_debug_voice")
+        model = st.text_input("Gemini TTS 模型", value="gemini-2.5-flash-preview-tts", key="gemini_debug_model")
+        style = st.text_input("风格指令（可选）", value="请用温柔、自然、略慢的语气朗读：", key="gemini_debug_style")
+
+        blocks = extract_chapter_blocks(epub_bytes, book, st.session_state.chapter_idx)
+        if not blocks:
+            st.warning("本章无可朗读段落。")
+        else:
+            start_idx = st.number_input("从第几段开始", min_value=1, max_value=len(blocks), value=1, step=1, key="gemini_debug_start")
+            count = st.number_input("朗读多少段", min_value=1, max_value=min(40, len(blocks)), value=min(8, len(blocks)), step=1, key="gemini_debug_count")
+            tts_text = "\n\n".join(b["text"] for b in blocks[int(start_idx) - 1: int(start_idx) - 1 + int(count)])
+
+            if st.button("生成并播放（Gemini TTS）", use_container_width=True, key="gemini_debug_play"):
+                try:
+                    with st.spinner("正在生成音频（WAV）…"):
+                        wav_bytes = gemini_tts_wav(tts_text, voice_name=voice, model=model, style=style)
+                    st.audio(wav_bytes, format="audio/wav")
+                except Exception as e:
+                    st.error(f"生成失败：{e}")
+                    st.caption("检查：Key 是否设置、模型名称是否可用。")
