@@ -1,3 +1,6 @@
+st.sidebar.success("BUILD: WEB-SPEECH + CLICK-TO-READ 已启用（如果你看不到这行，说明跑的不是这个 app.py）")
+
+
 import asyncio
 import base64
 import hashlib
