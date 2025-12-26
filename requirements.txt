@@ -10,3 +10,4 @@ openai>=1.0.0
 
 # 可选：Google Gemini TTS（Kore 等）
 google-genai
+google-cloud-texttospeech>=2.16.0
