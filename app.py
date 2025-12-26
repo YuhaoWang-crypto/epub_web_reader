@@ -1108,3 +1108,62 @@ if blocks:
 else:
     st.info("本章没有可朗读的段落。")
 
+
+
+try:
+    from google.cloud import texttospeech
+    GCP_TTS_AVAILABLE = True
+except Exception:
+    GCP_TTS_AVAILABLE = False
+
+@st.cache_data(show_spinner=False)
+def chirp3_hd_tts_mp3(text: str, voice_name: str = "cmn-CN-Chirp3-HD-Kore") -> bytes:
+    if not GCP_TTS_AVAILABLE:
+        raise RuntimeError("未安装 google-cloud-texttospeech")
+
+    client = texttospeech.TextToSpeechClient()
+
+    synthesis_input = texttospeech.SynthesisInput(text=text)
+
+    voice = texttospeech.VoiceSelectionParams(
+        language_code="cmn-CN",
+        name=voice_name,
+    )
+
+    audio_config = texttospeech.AudioConfig(
+        audio_encoding=texttospeech.AudioEncoding.MP3
+    )
+
+    resp = client.synthesize_speech(
+        input=synthesis_input,
+        voice=voice,
+        audio_config=audio_config,
+    )
+    return resp.audio_content
+
+
+
+with st.expander("在线朗读（Google Chirp 3 HD：中文 Kore / Vindemiatrix 等）", expanded=True):
+    if not GCP_TTS_AVAILABLE:
+        st.info("未安装 google-cloud-texttospeech；并且需要配置 Google Cloud 凭据（GOOGLE_APPLICATION_CREDENTIALS）。")
+    else:
+        voice_map = {
+            "Kore（偏清晰/坚定）": "cmn-CN-Chirp3-HD-Kore",
+            "Vindemiatrix（Gentle，更温柔）": "cmn-CN-Chirp3-HD-Vindemiatrix",
+            "Zephyr（更明亮）": "cmn-CN-Chirp3-HD-Zephyr",
+            "Puck（更活泼）": "cmn-CN-Chirp3-HD-Puck",
+            "Charon（更信息播报感）": "cmn-CN-Chirp3-HD-Charon",
+        }
+        label = st.selectbox("选择声音", list(voice_map.keys()), index=1)
+        voice_name = voice_map[label]
+
+        blocks = extract_chapter_blocks(epub_bytes, book, st.session_state.chapter_idx)
+        start_idx = st.number_input("从第几段开始", 1, len(blocks), 1, 1)
+        count = st.number_input("朗读多少段", 1, min(40, len(blocks)), min(8, len(blocks)), 1)
+        tts_text = "\n\n".join(b["text"] for b in blocks[int(start_idx)-1:int(start_idx)-1+int(count)])
+
+        if st.button("生成并播放（Chirp3 HD）", use_container_width=True):
+            with st.spinner("生成音频…"):
+                mp3 = chirp3_hd_tts_mp3(tts_text, voice_name=voice_name)
+            st.audio(mp3, format="audio/mp3")
+
