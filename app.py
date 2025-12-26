@@ -753,7 +753,11 @@ def gemini_tts_wav(text: str, voice_name: str, model: str, style: str = "") -> b
     if not GEMINI_AVAILABLE:
         raise RuntimeError("google-genai 未安装")
 
-    client = genai.Client()
+    # client = genai.Client()
+    # client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+    client = genai.Client(api_key=st.secrets["AIzaSyDPT10wRVro_z6sPmLN8JGpEkRZjYXiFV0"])
+
+    
     contents = text if not style.strip() else f"{style.strip()}\n\n{text}"
 
     resp = client.models.generate_content(
