@@ -904,6 +904,11 @@ chapter_text, chapter_body_html = extract_chapter_text_and_html(
     embed_images=(embed_images and view_mode == "排版（HTML）"),
 )
 
+
+
+
+
+
 # mode rendering
 if view_mode == "纯文本":
     safe_text = chapter_text.replace("\n", "  \n")
@@ -946,34 +951,73 @@ elif view_mode == "对照翻译（英->中）":
             )
             components.html(full_html, height=780, scrolling=True)
 
+        # with colR:
+        #     st.markdown("#### 中文翻译")
+        #     if not is_english:
+        #         st.info("检测到本页不像英文，未自动翻译。你可以切回“排版/纯文本”阅读。")
+        #         st.text_area("内容", src_text, height=780)
+        #     else:
+        #         if not OPENAI_AVAILABLE:
+        #             st.error("未安装 openai：请在 requirements.txt 加 openai 并重新安装。")
+        #         else:
+        #             model = st.sidebar.text_input("翻译模型（OpenAI）", value="gpt-4o-mini")
+        #             if st.sidebar.checkbox("自动翻译当前页", value=True):
+        #                 try:
+        #                     with st.spinner("正在翻译…"):
+        #                         zh = translate_en_to_zh_openai(src_text, model=model)
+        #                     st.text_area("翻译结果（可复制）", zh, height=780)
+        #                 except Exception as e:
+        #                     st.error(f"翻译失败：{e}")
+        #                     st.caption("检查：是否已设置 OPENAI_API_KEY？")
+        #             else:
+        #                 st.text_area("原文（将用于翻译）", src_text, height=300)
+        #                 if st.button("翻译此页", use_container_width=True):
+        #                     try:
+        #                         with st.spinner("正在翻译…"):
+        #                             zh = translate_en_to_zh_openai(src_text, model=model)
+        #                         st.text_area("翻译结果（可复制）", zh, height=460)
+        #                     except Exception as e:
+        #                         st.error(f"翻译失败：{e}")
+        #                         st.caption("检查：是否已设置 OPENAI_API_KEY？")
+
+
         with colR:
-            st.markdown("#### 中文翻译")
+            st.markdown("#### 中文翻译（Gemini）")
+        
+            # 仅当疑似英文时才翻译（你原先如果有检测逻辑，保留即可）
             if not is_english:
-                st.info("检测到本页不像英文，未自动翻译。你可以切回“排版/纯文本”阅读。")
-                st.text_area("内容", src_text, height=780)
+                st.info("检测到本页不像英文，未自动翻译。")
+                st.text_area("内容", src_text, height=780, key="not_en_text_area")
             else:
-                if not OPENAI_AVAILABLE:
-                    st.error("未安装 openai：请在 requirements.txt 加 openai 并重新安装。")
+                # 选择 Gemini 翻译模型（建议用文本模型，不要用 TTS 模型）
+                gemini_text_model = st.sidebar.text_input(
+                    "翻译模型（Gemini）",
+                    value="gemini-2.5-flash",
+                    key="gemini_translate_model",
+                )
+        
+                # 自动翻译开关
+                if st.sidebar.checkbox("自动翻译当前页", value=True, key="gemini_auto_translate_ck"):
+                    try:
+                        with st.spinner("正在翻译（Gemini）…"):
+                            zh = translate_en_to_zh_gemini(src_text, model=gemini_text_model)
+                        st.text_area("翻译结果（可复制）", zh, height=780, key="zh_translation_area_gemini")
+                    except Exception as e:
+                        st.error(f"翻译失败：{e}")
+                        st.caption("检查：是否已设置 GEMINI_API_KEY / GOOGLE_API_KEY（环境变量或 Streamlit Secrets）？")
                 else:
-                    model = st.sidebar.text_input("翻译模型（OpenAI）", value="gpt-4o-mini")
-                    if st.sidebar.checkbox("自动翻译当前页", value=True):
+                    st.text_area("原文（将用于翻译）", src_text, height=300, key="src_text_area_gemini")
+                    if st.button("翻译此页（Gemini）", use_container_width=True, key="btn_translate_gemini"):
                         try:
-                            with st.spinner("正在翻译…"):
-                                zh = translate_en_to_zh_openai(src_text, model=model)
-                            st.text_area("翻译结果（可复制）", zh, height=780)
+                            with st.spinner("正在翻译（Gemini）…"):
+                                zh = translate_en_to_zh_gemini(src_text, model=gemini_text_model)
+                            st.text_area("翻译结果（可复制）", zh, height=460, key="zh_area_gemini_manual")
                         except Exception as e:
                             st.error(f"翻译失败：{e}")
-                            st.caption("检查：是否已设置 OPENAI_API_KEY？")
-                    else:
-                        st.text_area("原文（将用于翻译）", src_text, height=300)
-                        if st.button("翻译此页", use_container_width=True):
-                            try:
-                                with st.spinner("正在翻译…"):
-                                    zh = translate_en_to_zh_openai(src_text, model=model)
-                                st.text_area("翻译结果（可复制）", zh, height=460)
-                            except Exception as e:
-                                st.error(f"翻译失败：{e}")
-                                st.caption("检查：是否已设置 OPENAI_API_KEY？")
+                            st.caption("检查：是否已设置 GEMINI_API_KEY / GOOGLE_API_KEY（环境变量或 Streamlit Secrets）？")
+
+
+
 
 else:
     # HTML mode
@@ -988,6 +1032,46 @@ else:
         speech_lang=speech_lang,
     )
     components.html(full_html, height=900, scrolling=True)
+
+
+with colR:
+    st.markdown("#### 中文翻译（Gemini）")
+
+    # 仅当疑似英文时才翻译（你原先如果有检测逻辑，保留即可）
+    if not is_english:
+        st.info("检测到本页不像英文，未自动翻译。")
+        st.text_area("内容", src_text, height=780, key="not_en_text_area")
+    else:
+        # 选择 Gemini 翻译模型（建议用文本模型，不要用 TTS 模型）
+        gemini_text_model = st.sidebar.text_input(
+            "翻译模型（Gemini）",
+            value="gemini-2.5-flash",
+            key="gemini_translate_model",
+        )
+
+        # 自动翻译开关
+        if st.sidebar.checkbox("自动翻译当前页", value=True, key="gemini_auto_translate_ck"):
+            try:
+                with st.spinner("正在翻译（Gemini）…"):
+                    zh = translate_en_to_zh_gemini(src_text, model=gemini_text_model)
+                st.text_area("翻译结果（可复制）", zh, height=780, key="zh_translation_area_gemini")
+            except Exception as e:
+                st.error(f"翻译失败：{e}")
+                st.caption("检查：是否已设置 GEMINI_API_KEY / GOOGLE_API_KEY（环境变量或 Streamlit Secrets）？")
+        else:
+            st.text_area("原文（将用于翻译）", src_text, height=300, key="src_text_area_gemini")
+            if st.button("翻译此页（Gemini）", use_container_width=True, key="btn_translate_gemini"):
+                try:
+                    with st.spinner("正在翻译（Gemini）…"):
+                        zh = translate_en_to_zh_gemini(src_text, model=gemini_text_model)
+                    st.text_area("翻译结果（可复制）", zh, height=460, key="zh_area_gemini_manual")
+                except Exception as e:
+                    st.error(f"翻译失败：{e}")
+                    st.caption("检查：是否已设置 GEMINI_API_KEY / GOOGLE_API_KEY（环境变量或 Streamlit Secrets）？")
+
+
+
+
 
 # -----------------------------
 # Optional: TTS (Edge -> MP3)
@@ -1171,3 +1255,35 @@ with st.expander("在线朗读（Google Chirp 3 HD：中文 Kore / Vindemiatrix 
                 mp3 = chirp3_hd_tts_mp3(tts_text, voice_name=voice_name)
             st.audio(mp3, format="audio/mp3")
 
+
+
+
+@st.cache_data(show_spinner=False)
+def translate_en_to_zh_gemini(text: str, model: str = "gemini-2.5-flash") -> str:
+    """
+    用 Gemini 文本模型把英文翻译成中文（简体）。
+    依赖 GEMINI_API_KEY 或 GOOGLE_API_KEY（环境变量或 Streamlit Secrets）。
+    """
+    api_key = get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("未检测到 GEMINI_API_KEY / GOOGLE_API_KEY（请在环境变量或 Streamlit Secrets 配置）")
+
+    client = genai.Client(api_key=api_key)
+
+    prompt = (
+        "你是一名专业文学译者。请把下面英文翻译成简体中文。\n"
+        "要求：\n"
+        "1) 尽量逐段对应，保留段落换行。\n"
+        "2) 不要添加解释、注释或多余内容。\n"
+        "3) 人名/地名保持一致。\n\n"
+        f"{text}"
+    )
+
+    resp = client.models.generate_content(
+        model=model,
+        contents=prompt
+    )
+    out = (resp.text or "").strip()
+    if not out:
+        raise RuntimeError("Gemini 未返回可用文本（resp.text 为空）")
+    return out
