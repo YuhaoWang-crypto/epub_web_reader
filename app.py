@@ -344,15 +344,242 @@ def extract_chapter_text_and_html(epub_bytes: bytes, book: dict, chapter_idx: in
     return text, body_html
 
 
-def wrap_reader_html(body_html: str, font_size: int, line_height: float, max_width: int, theme: str):
+# def wrap_reader_html(body_html: str, font_size: int, line_height: float, max_width: int, theme: str):
+#     if theme == "Dark":
+#         bg = "#0f1115"
+#         fg = "#e6e6e6"
+#         subtle = "#b6b6b6"
+#     else:
+#         bg = "#ffffff"
+#         fg = "#111111"
+#         subtle = "#555555"
+
+#     return f"""<!doctype html>
+# <html>
+# <head>
+# <meta charset="utf-8"/>
+# <meta name="viewport" content="width=device-width, initial-scale=1" />
+# <style>
+#   body {{
+#     background: {bg};
+#     color: {fg};
+#     margin: 0;
+#     padding: 0;
+#     font-size: {font_size}px;
+#     line-height: {line_height};
+#     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC",
+#                  "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif;
+#   }}
+#   .reader {{
+#     max-width: {max_width}px;
+#     margin: 0 auto;
+#     padding: 24px 18px 64px 18px;
+#     word-wrap: break-word;
+#     overflow-wrap: anywhere;
+#   }}
+#   img {{ max-width: 100%; height: auto; }}
+#   a {{ color: inherit; text-decoration: underline; }}
+#   hr {{ border: none; border-top: 1px solid rgba(127,127,127,.35); }}
+#   blockquote {{
+#     margin: 16px 0;
+#     padding: 10px 14px;
+#     border-left: 3px solid rgba(127,127,127,.6);
+#     color: {subtle};
+#     background: rgba(127,127,127,.08);
+#   }}
+# </style>
+# </head>
+# <body>
+#   <div class="reader">
+#     {body_html}
+#   </div>
+# </body>
+# </html>"""
+
+
+def wrap_reader_html(body_html: str, font_size: int, line_height: float, max_width: int, theme: str,
+                     enable_web_speech: bool, speech_lang: str):
     if theme == "Dark":
         bg = "#0f1115"
         fg = "#e6e6e6"
         subtle = "#b6b6b6"
+        panel = "rgba(255,255,255,.06)"
+        border = "rgba(255,255,255,.14)"
     else:
         bg = "#ffffff"
         fg = "#111111"
         subtle = "#555555"
+        panel = "rgba(0,0,0,.04)"
+        border = "rgba(0,0,0,.12)"
+
+    tts_toolbar = ""
+    tts_script = ""
+
+    if enable_web_speech:
+        # 一个轻量工具栏：开始/暂停/继续/停止 + 语速 + 声音选择
+        # 特性：
+        # - 点击任意段落/标题/列表项，即从该处连续朗读
+        # - 支持从“选区/光标处”开始（先选中一段文本再点按钮）
+        tts_toolbar = f"""
+        <div class="ttsbar">
+          <div class="row">
+            <button id="ttsStartTop">从本章开头朗读</button>
+            <button id="ttsStartSel">从选区/光标处朗读</button>
+            <button id="ttsPause">暂停</button>
+            <button id="ttsResume">继续</button>
+            <button id="ttsStop">停止</button>
+          </div>
+          <div class="row">
+            <label>语速</label>
+            <input id="ttsRate" type="range" min="0.6" max="1.4" step="0.05" value="1.0"/>
+            <span id="ttsRateVal">1.00</span>
+            <label style="margin-left:14px;">声音</label>
+            <select id="ttsVoice"></select>
+            <span class="tip">提示：直接点击任意段落即可从该段开始读</span>
+          </div>
+        </div>
+        """
+
+        tts_script = f"""
+        <script>
+        (function() {{
+          const LANG = {repr(speech_lang)};
+
+          function $(id) {{ return document.getElementById(id); }}
+
+          const rate = $("ttsRate");
+          const rateVal = $("ttsRateVal");
+          const voiceSel = $("ttsVoice");
+
+          rate.addEventListener("input", () => {{
+            rateVal.textContent = Number(rate.value).toFixed(2);
+          }});
+
+          // 把可朗读的块元素收集起来（你也可以按需要加/减标签）
+          function collectSpeakables() {{
+            const nodes = Array.from(document.querySelectorAll(
+              ".reader p, .reader li, .reader blockquote, .reader h1, .reader h2, .reader h3, .reader h4, .reader h5, .reader h6"
+            ));
+            const speakables = nodes
+              .map(n => ({{ el: n, text: (n.innerText || "").trim() }}))
+              .filter(x => x.text.length > 0);
+
+            speakables.forEach((x, i) => {{
+              x.el.dataset.ttsIndex = String(i);
+              x.el.classList.add("tts-clickable");
+              x.el.addEventListener("click", (evt) => {{
+                // 如果点到链接，就不抢事件
+                if (evt.target && evt.target.closest && evt.target.closest("a")) return;
+                startFrom(i);
+              }});
+            }});
+            return speakables;
+          }}
+
+          let speakables = collectSpeakables();
+          let current = 0;
+          let speaking = false;
+
+          function clearHighlight() {{
+            document.querySelectorAll(".tts-speaking").forEach(n => n.classList.remove("tts-speaking"));
+          }}
+          function highlight(i) {{
+            clearHighlight();
+            const el = speakables[i]?.el;
+            if (!el) return;
+            el.classList.add("tts-speaking");
+            // 滚动到当前段落（更像“从哪里开始就从哪里读”）
+            el.scrollIntoView({{ block: "center", behavior: "smooth" }});
+          }}
+
+          function loadVoices() {{
+            const voices = speechSynthesis.getVoices() || [];
+            // 优先显示符合语言的声音；如果一个都没有，就显示全部
+            const filtered = voices.filter(v => (v.lang || "").toLowerCase().startsWith(LANG.toLowerCase()));
+            const list = (filtered.length ? filtered : voices);
+
+            voiceSel.innerHTML = "";
+            list.forEach(v => {{
+              const opt = document.createElement("option");
+              opt.value = v.name;
+              opt.textContent = `${{v.name}} (${{v.lang}})`;
+              voiceSel.appendChild(opt);
+            }});
+          }}
+          speechSynthesis.onvoiceschanged = loadVoices;
+          loadVoices();
+
+          function getSelectedVoice() {{
+            const name = voiceSel.value;
+            const voices = speechSynthesis.getVoices() || [];
+            return voices.find(v => v.name === name) || null;
+          }}
+
+          function stopAll() {{
+            speechSynthesis.cancel();
+            speaking = false;
+            clearHighlight();
+          }}
+
+          function speakOne(i) {{
+            if (i >= speakables.length) {{
+              stopAll();
+              return;
+            }}
+            current = i;
+            speaking = true;
+            highlight(i);
+
+            const u = new SpeechSynthesisUtterance(speakables[i].text);
+            u.lang = LANG;
+            u.rate = Number(rate.value);
+
+            const v = getSelectedVoice();
+            if (v) u.voice = v;
+
+            u.onend = () => {{
+              if (!speaking) return;
+              speakOne(i + 1);
+            }};
+            u.onerror = () => {{
+              // 出错就跳到下一段，避免卡死
+              if (!speaking) return;
+              speakOne(i + 1);
+            }};
+            speechSynthesis.speak(u);
+          }}
+
+          function startFrom(i) {{
+            stopAll();
+            speakOne(i);
+          }}
+
+          function startFromSelection() {{
+            const sel = window.getSelection();
+            if (!sel || sel.rangeCount === 0) return;
+            let node = sel.anchorNode;
+            if (!node) return;
+            if (node.nodeType === 3) node = node.parentElement; // text node -> element
+            while (node && !node.dataset.ttsIndex) node = node.parentElement;
+            if (!node) return;
+            const idx = parseInt(node.dataset.ttsIndex, 10);
+            if (!isNaN(idx)) startFrom(idx);
+          }}
+
+          $("ttsStartTop").addEventListener("click", () => startFrom(0));
+          $("ttsStartSel").addEventListener("click", () => startFromSelection());
+          $("ttsPause").addEventListener("click", () => speechSynthesis.pause());
+          $("ttsResume").addEventListener("click", () => speechSynthesis.resume());
+          $("ttsStop").addEventListener("click", () => stopAll());
+
+          // 如果章节内容是动态更新的（翻章），重新收集一次
+          // Streamlit iframe 每次刷新内容通常会重建，这里留着兜底
+          window.addEventListener("load", () => {{
+            speakables = collectSpeakables();
+          }});
+        }})();
+        </script>
+        """
 
     return f"""<!doctype html>
 <html>
@@ -373,7 +600,7 @@ def wrap_reader_html(body_html: str, font_size: int, line_height: float, max_wid
   .reader {{
     max-width: {max_width}px;
     margin: 0 auto;
-    padding: 24px 18px 64px 18px;
+    padding: 72px 18px 64px 18px; /* 顶部留给工具栏 */
     word-wrap: break-word;
     overflow-wrap: anywhere;
   }}
@@ -387,14 +614,72 @@ def wrap_reader_html(body_html: str, font_size: int, line_height: float, max_wid
     color: {subtle};
     background: rgba(127,127,127,.08);
   }}
+
+  /* 朗读工具栏 */
+  .ttsbar {{
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    backdrop-filter: blur(8px);
+    background: {panel};
+    border-bottom: 1px solid {border};
+    padding: 10px 12px;
+    z-index: 9999;
+    font-size: 14px;
+  }}
+  .ttsbar .row {{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin: 6px 0;
+  }}
+  .ttsbar button {{
+    padding: 6px 10px;
+    border: 1px solid {border};
+    background: transparent;
+    color: {fg};
+    border-radius: 6px;
+    cursor: pointer;
+  }}
+  .ttsbar select {{
+    padding: 6px 8px;
+    border: 1px solid {border};
+    background: transparent;
+    color: {fg};
+    border-radius: 6px;
+  }}
+  .ttsbar input[type="range"] {{
+    width: 180px;
+  }}
+  .ttsbar .tip {{
+    margin-left: 10px;
+    color: {subtle};
+  }}
+
+  .tts-clickable {{
+    cursor: pointer;
+  }}
+  .tts-speaking {{
+    outline: 2px solid rgba(255, 80, 80, .55);
+    outline-offset: 3px;
+    border-radius: 6px;
+  }}
 </style>
 </head>
 <body>
+  {tts_toolbar}
   <div class="reader">
     {body_html}
   </div>
+  {tts_script}
 </body>
 </html>"""
+
+
+
+
 
 
 # -----------------------------
@@ -481,6 +766,8 @@ with st.sidebar:
 
     view_mode = st.radio("显示模式", ["排版（HTML）", "纯文本"], index=0)
     embed_images = st.checkbox("嵌入图片（部分书有插图时更完整）", value=True)
+    enable_web_speech = st.checkbox("在线朗读（浏览器直接读，不生成MP3；点击段落从此处开始）", value=True)
+
 
     st.divider()
     st.caption("提示：此工具用于你有合法权限阅读的 EPUB；DRM 书籍可能无法解析。")
@@ -561,14 +848,29 @@ if view_mode == "纯文本":
     safe_text = chapter_text.replace("\n", "  \n")
     st.markdown(safe_text)
 else:
+    # full_html = wrap_reader_html(
+    #     body_html=chapter_body_html,
+    #     font_size=font_size,
+    #     line_height=line_height,
+    #     max_width=max_width,
+    #     theme=theme,
+    # )
+    # components.html(full_html, height=900, scrolling=True)
+    speech_lang = "en-US" if (book.get("language","").lower().startswith("en")) else "zh-CN"
+
     full_html = wrap_reader_html(
         body_html=chapter_body_html,
         font_size=font_size,
         line_height=line_height,
         max_width=max_width,
         theme=theme,
+        enable_web_speech=enable_web_speech,
+        speech_lang=speech_lang,
     )
     components.html(full_html, height=900, scrolling=True)
+
+
+
 
 # -----------------------------
 # Optional TTS section
