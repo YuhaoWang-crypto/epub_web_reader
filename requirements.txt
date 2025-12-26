@@ -1,4 +1,12 @@
 streamlit>=1.31
 beautifulsoup4>=4.12
 lxml>=5.0
+
+# 可选：Edge TTS 生成 MP3
 edge-tts>=6.1.0
+
+# 可选：英->中对照翻译
+openai>=1.0.0
+
+# 可选：Google Gemini TTS（Kore 等）
+google-genai
