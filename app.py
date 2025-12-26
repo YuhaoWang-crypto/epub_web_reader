@@ -1,3 +1,4 @@
+import os
 import asyncio
 import base64
 import hashlib
@@ -14,9 +15,9 @@ import streamlit as st
 import streamlit.components.v1 as components
 from bs4 import BeautifulSoup
 
-# -----------------------------
+# ============================================================
 # Optional dependencies
-# -----------------------------
+# ============================================================
 try:
     import edge_tts  # pip install edge-tts
     EDGE_TTS_AVAILABLE = True
@@ -37,15 +38,15 @@ except Exception:
     GEMINI_AVAILABLE = False
 
 
-# -----------------------------
+# ============================================================
 # App config
-# -----------------------------
+# ============================================================
 st.set_page_config(page_title="EPUB Web Reader", layout="wide")
 
 
-# -----------------------------
+# ============================================================
 # Helpers
-# -----------------------------
+# ============================================================
 def normalize_zip_path(path: str) -> str:
     path = (path or "").replace("\\", "/")
     path = re.sub(r"^\./", "", path)
@@ -125,9 +126,21 @@ def run_coro(coro):
         return out.get("value")
 
 
-# -----------------------------
+def get_secret(*names: str) -> str:
+    """
+    Read secrets from Streamlit Secrets first, then environment variables.
+    """
+    for n in names:
+        if hasattr(st, "secrets") and n in st.secrets and str(st.secrets.get(n, "")).strip():
+            return str(st.secrets.get(n)).strip()
+        if str(os.environ.get(n, "")).strip():
+            return str(os.environ.get(n)).strip()
+    return ""
+
+
+# ============================================================
 # TOC parsing
-# -----------------------------
+# ============================================================
 def parse_nav_toc(z: zipfile.ZipFile, nav_path: str):
     html = decode_bytes(z.read(nav_path))
     soup = soup_html(html)
@@ -179,9 +192,9 @@ def parse_ncx_toc(z: zipfile.ZipFile, ncx_path: str):
     return entries
 
 
-# -----------------------------
+# ============================================================
 # EPUB parsing (DRM-free)
-# -----------------------------
+# ============================================================
 @st.cache_data(show_spinner=False)
 def parse_epub(epub_bytes: bytes):
     z = zipfile.ZipFile(io.BytesIO(epub_bytes))
@@ -206,13 +219,11 @@ def parse_epub(epub_bytes: bytes):
     opf_dir = posixpath.dirname(opf_path)
     opf_root = ET.fromstring(z.read(opf_path))
 
-    # metadata
     metadata_el = next((e for e in opf_root.iter() if isinstance(e.tag, str) and e.tag.endswith("metadata")), None)
     title = first_child_text(metadata_el, "title") or "Untitled"
     creator = first_child_text(metadata_el, "creator") or ""
     language = first_child_text(metadata_el, "language") or ""
 
-    # manifest
     manifest_el = next((e for e in opf_root.iter() if isinstance(e.tag, str) and e.tag.endswith("manifest")), None)
     manifest = {}
     if manifest_el is not None:
@@ -228,14 +239,11 @@ def parse_epub(epub_bytes: bytes):
             path = normalize_zip_path(posixpath.join(opf_dir, href))
             manifest[iid] = {"id": iid, "href": href, "path": path, "media_type": media_type, "properties": props}
 
-    # mime map
     mime_by_path = {m["path"]: (m.get("media_type") or "") for m in manifest.values()}
 
-    # spine
     spine_el = next((e for e in opf_root.iter() if isinstance(e.tag, str) and e.tag.endswith("spine")), None)
     spine_idrefs = []
     ncx_id = spine_el.attrib.get("toc") if spine_el is not None else None
-
     if spine_el is not None:
         for itemref in list(spine_el):
             if isinstance(itemref.tag, str) and itemref.tag.endswith("itemref"):
@@ -258,14 +266,12 @@ def parse_epub(epub_bytes: bytes):
     if not spine_paths:
         raise ValueError("未能从 spine 中解析到可阅读章节（可能是非常规 EPUB 或受保护文件）。")
 
-    # nav doc (epub3)
     nav_path = None
     for m in manifest.values():
         if "nav" in (m.get("properties") or "").split():
             nav_path = m["path"]
             break
 
-    # ncx (epub2)
     ncx_path = None
     if ncx_id and ncx_id in manifest:
         ncx_path = manifest[ncx_id]["path"]
@@ -276,41 +282,29 @@ def parse_epub(epub_bytes: bytes):
                 ncx_path = m["path"]
                 break
 
-    # cover image (best-effort)
     cover_path = None
     for m in manifest.values():
         props = (m.get("properties") or "").split()
         if "cover-image" in props and (m.get("media_type") or "").startswith("image/"):
             cover_path = m["path"]
             break
-    if not cover_path:
-        for m in manifest.values():
-            if (m.get("media_type") or "").startswith("image/") and re.search(r"cover", m.get("id", ""), re.I):
-                cover_path = m["path"]
-                break
     if cover_path and cover_path not in file_list:
         cover_path = None
 
-    # toc
     toc_entries = []
     if nav_path and nav_path in file_list:
         toc_entries = parse_nav_toc(z, nav_path)
     elif ncx_path and ncx_path in file_list:
         toc_entries = parse_ncx_toc(z, ncx_path)
 
-    # map toc -> spine index
     path_to_index = {p: i for i, p in enumerate(spine_paths)}
+    chapter_titles = [None] * len(spine_paths)
     for e in toc_entries:
         p = e.get("path")
         if p in path_to_index:
-            e["chapter_index"] = path_to_index[p]
-
-    # chapter titles
-    chapter_titles = [None] * len(spine_paths)
-    for e in toc_entries:
-        idx = e.get("chapter_index")
-        if isinstance(idx, int) and 0 <= idx < len(chapter_titles) and not chapter_titles[idx]:
-            chapter_titles[idx] = e.get("title") or None
+            idx = path_to_index[p]
+            if not chapter_titles[idx]:
+                chapter_titles[idx] = e.get("title") or None
     for i in range(len(chapter_titles)):
         if not chapter_titles[i]:
             chapter_titles[i] = f"第 {i+1} 章"
@@ -327,9 +321,9 @@ def parse_epub(epub_bytes: bytes):
     }
 
 
-# -----------------------------
+# ============================================================
 # Chapter extraction & rendering
-# -----------------------------
+# ============================================================
 def embed_images_in_body(body, chapter_path: str, z: zipfile.ZipFile, mime_by_path: dict, file_list: set, max_images: int = 300):
     base_dir = posixpath.dirname(chapter_path)
     count = 0
@@ -357,34 +351,23 @@ def extract_chapter_text_and_html(epub_bytes: bytes, book: dict, chapter_idx: in
 
     soup = soup_html(html)
     body = soup.body or soup
-
-    # remove scripts
     for s in body.find_all("script"):
         s.decompose()
 
-    # text
     text = body.get_text("\n", strip=True)
 
-    # html for display
     if embed_images:
         embed_images_in_body(body, chapter_path, z, book["mime_by_path"], book["file_list"])
     body_html = "".join(str(x) for x in body.contents)
-
     return text, body_html
 
 
 def extract_chapter_blocks(epub_bytes: bytes, book: dict, chapter_idx: int):
-    """
-    Extract block-level elements so we can:
-    - paging by N blocks
-    - start reading from block N
-    """
     z = zipfile.ZipFile(io.BytesIO(epub_bytes))
     chapter_path = book["spine_paths"][chapter_idx]
     html = decode_bytes(z.read(chapter_path))
     soup = soup_html(html)
     body = soup.body or soup
-
     for s in body.find_all("script"):
         s.decompose()
 
@@ -398,7 +381,6 @@ def extract_chapter_blocks(epub_bytes: bytes, book: dict, chapter_idx: int):
         txt = body.get_text("\n", strip=True)
         parts = [p.strip() for p in re.split(r"\n{2,}", txt) if p.strip()]
         blocks = [{"text": p, "html": f"<p>{p}</p>"} for p in parts]
-
     return blocks
 
 
@@ -406,9 +388,9 @@ def paginate_blocks(blocks, per_page: int):
     return [blocks[i:i + per_page] for i in range(0, len(blocks), per_page)]
 
 
-# -----------------------------
+# ============================================================
 # HTML wrapper (Reader + optional browser TTS)
-# -----------------------------
+# ============================================================
 def wrap_reader_html(body_html: str, font_size: int, line_height: float, max_width: int, theme: str,
                      enable_web_speech: bool, speech_lang: str):
     if theme == "Dark":
@@ -581,7 +563,6 @@ def wrap_reader_html(body_html: str, font_size: int, line_height: float, max_wid
         """
 
     top_padding = "72px" if enable_web_speech else "24px"
-
     return f"""<!doctype html>
 <html>
 <head>
@@ -676,13 +657,12 @@ def wrap_reader_html(body_html: str, font_size: int, line_height: float, max_wid
 </html>"""
 
 
-# -----------------------------
+# ============================================================
 # Edge TTS helpers (MP3)
-# -----------------------------
+# ============================================================
 def chunk_text(text: str, max_chars: int = 3000):
     paras = [p.strip() for p in re.split(r"\n{2,}|\r\n{2,}", text) if p.strip()]
-    chunks = []
-    buf = ""
+    chunks, buf = [], ""
     for p in paras:
         if not buf:
             buf = p
@@ -735,9 +715,9 @@ async def edge_tts_mp3_long(text: str, voice: str, rate: str, pitch: str, volume
     return bytes(out)
 
 
-# -----------------------------
+# ============================================================
 # Google Gemini TTS helpers (WAV in memory)
-# -----------------------------
+# ============================================================
 def pcm16_to_wav_bytes(pcm: bytes, rate: int = 24000, channels: int = 1, sample_width: int = 2) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
@@ -753,11 +733,9 @@ def gemini_tts_wav(text: str, voice_name: str, model: str, style: str = "") -> b
     if not GEMINI_AVAILABLE:
         raise RuntimeError("google-genai 未安装")
 
-    # client = genai.Client()
-    # client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
-    client = genai.Client(api_key=st.secrets["AIzaSyDPT10wRVro_z6sPmLN8JGpEkRZjYXiFV0"])
+    api_key = get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY")
+    client = genai.Client(api_key=api_key) if api_key else genai.Client()
 
-    
     contents = text if not style.strip() else f"{style.strip()}\n\n{text}"
 
     resp = client.models.generate_content(
@@ -783,9 +761,9 @@ def gemini_tts_wav(text: str, voice_name: str, model: str, style: str = "") -> b
     return pcm16_to_wav_bytes(pcm, rate=24000)
 
 
-# -----------------------------
-# OpenAI translation helper
-# -----------------------------
+# ============================================================
+# Translation helpers
+# ============================================================
 @st.cache_data(show_spinner=False)
 def translate_en_to_zh_openai(text: str, model: str) -> str:
     if not OPENAI_AVAILABLE:
@@ -796,16 +774,47 @@ def translate_en_to_zh_openai(text: str, model: str) -> str:
         "要求：\n"
         "1) 尽量逐段对应（保留段落换行）。\n"
         "2) 不要添加解释、注释或多余内容。\n"
-        "3) 保持人名/地名一致。\n\n"
+        "3) 保持人名/地名一致。\n"
+        "4) 语气自然，保留原文风格。\n\n"
         f"{text}"
     )
     resp = client.responses.create(model=model, input=prompt)
     return resp.output_text.strip()
 
 
-# -----------------------------
+@st.cache_data(show_spinner=False)
+def translate_en_to_zh_gemini(text: str, model: str = "gemini-2.0-flash", style: str = "") -> str:
+    if not GEMINI_AVAILABLE:
+        raise RuntimeError("google-genai 未安装")
+
+    api_key = get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY")
+    client = genai.Client(api_key=api_key) if api_key else genai.Client()
+
+    prompt = (
+        "请把下面英文翻译成简体中文。\n"
+        "要求：\n"
+        "1) 尽量逐段对应（保留段落换行）。\n"
+        "2) 不要添加解释、注释或多余内容。\n"
+        "3) 保持人名/地名一致。\n"
+        "4) 语气自然，保留原文风格。\n"
+    )
+    if style.strip():
+        prompt += f"\n额外风格要求：{style.strip()}\n"
+    prompt += "\n---\n" + text
+
+    resp = client.models.generate_content(model=model, contents=prompt)
+    out = getattr(resp, "text", None)
+    if out and out.strip():
+        return out.strip()
+    try:
+        return resp.candidates[0].content.parts[0].text.strip()
+    except Exception:
+        raise RuntimeError("Gemini 返回格式异常，未能提取文本。")
+
+
+# ============================================================
 # UI
-# -----------------------------
+# ============================================================
 st.title("EPUB 在线阅读 + 在线朗读 + 对照翻译（Streamlit）")
 
 with st.sidebar:
@@ -843,13 +852,11 @@ except Exception as e:
     st.error(f"解析失败：{e}")
     st.stop()
 
-# init/reset session state when book changes
 if "book_hash" not in st.session_state or st.session_state.book_hash != book_hash:
     st.session_state.book_hash = book_hash
     st.session_state.chapter_idx = 0
     st.session_state.page_idx = 0
 
-# header meta
 meta_cols = st.columns([1, 4])
 with meta_cols[0]:
     if book.get("cover_path"):
@@ -867,7 +874,6 @@ with meta_cols[1]:
     if book.get("language"):
         st.caption(f"Language: {book['language']}")
 
-# chapter selection
 chapter_count = len(book["spine_paths"])
 labels = book["chapter_titles"]
 
@@ -881,7 +887,6 @@ if selected != st.session_state.chapter_idx:
     st.session_state.chapter_idx = int(selected)
     st.session_state.page_idx = 0
 
-# navigation
 nav_cols = st.columns([1, 1, 6])
 with nav_cols[0]:
     if st.button("上一章", disabled=(st.session_state.chapter_idx <= 0), use_container_width=True):
@@ -896,7 +901,6 @@ with nav_cols[1]:
 with nav_cols[2]:
     st.markdown(f"### {labels[st.session_state.chapter_idx]}")
 
-# load chapter content
 chapter_text, chapter_body_html = extract_chapter_text_and_html(
     epub_bytes=epub_bytes,
     book=book,
@@ -904,12 +908,6 @@ chapter_text, chapter_body_html = extract_chapter_text_and_html(
     embed_images=(embed_images and view_mode == "排版（HTML）"),
 )
 
-
-
-
-
-
-# mode rendering
 if view_mode == "纯文本":
     safe_text = chapter_text.replace("\n", "  \n")
     st.markdown(safe_text)
@@ -930,7 +928,7 @@ elif view_mode == "对照翻译（英->中）":
         left_html = "".join(b["html"] for b in page_blocks)
         src_text = "\n\n".join(b["text"] for b in page_blocks)
 
-        # english detection (best-effort)
+        # best-effort english detection
         is_english = book.get("language", "").lower().startswith("en")
         if not is_english:
             ascii_ratio = sum(1 for c in src_text if ord(c) < 128) / max(1, len(src_text))
@@ -946,81 +944,48 @@ elif view_mode == "对照翻译（英->中）":
                 line_height=line_height,
                 max_width=max_width,
                 theme=theme,
-                enable_web_speech=False,  # 对照页默认关（避免两个音源混乱）
+                enable_web_speech=False,
                 speech_lang="en-US",
             )
             components.html(full_html, height=780, scrolling=True)
 
-        # with colR:
-        #     st.markdown("#### 中文翻译")
-        #     if not is_english:
-        #         st.info("检测到本页不像英文，未自动翻译。你可以切回“排版/纯文本”阅读。")
-        #         st.text_area("内容", src_text, height=780)
-        #     else:
-        #         if not OPENAI_AVAILABLE:
-        #             st.error("未安装 openai：请在 requirements.txt 加 openai 并重新安装。")
-        #         else:
-        #             model = st.sidebar.text_input("翻译模型（OpenAI）", value="gpt-4o-mini")
-        #             if st.sidebar.checkbox("自动翻译当前页", value=True):
-        #                 try:
-        #                     with st.spinner("正在翻译…"):
-        #                         zh = translate_en_to_zh_openai(src_text, model=model)
-        #                     st.text_area("翻译结果（可复制）", zh, height=780)
-        #                 except Exception as e:
-        #                     st.error(f"翻译失败：{e}")
-        #                     st.caption("检查：是否已设置 OPENAI_API_KEY？")
-        #             else:
-        #                 st.text_area("原文（将用于翻译）", src_text, height=300)
-        #                 if st.button("翻译此页", use_container_width=True):
-        #                     try:
-        #                         with st.spinner("正在翻译…"):
-        #                             zh = translate_en_to_zh_openai(src_text, model=model)
-        #                         st.text_area("翻译结果（可复制）", zh, height=460)
-        #                     except Exception as e:
-        #                         st.error(f"翻译失败：{e}")
-        #                         st.caption("检查：是否已设置 OPENAI_API_KEY？")
-
-
         with colR:
-            st.markdown("#### 中文翻译（Gemini）")
-        
-            # 仅当疑似英文时才翻译（你原先如果有检测逻辑，保留即可）
+            st.markdown("#### 中文翻译")
             if not is_english:
                 st.info("检测到本页不像英文，未自动翻译。")
                 st.text_area("内容", src_text, height=780, key="not_en_text_area")
             else:
-                # 选择 Gemini 翻译模型（建议用文本模型，不要用 TTS 模型）
-                gemini_text_model = st.sidebar.text_input(
-                    "翻译模型（Gemini）",
-                    value="gemini-2.5-flash",
-                    key="gemini_translate_model",
-                )
-        
-                # 自动翻译开关
-                if st.sidebar.checkbox("自动翻译当前页", value=True, key="gemini_auto_translate_ck"):
-                    try:
-                        with st.spinner("正在翻译（Gemini）…"):
-                            zh = translate_en_to_zh_gemini(src_text, model=gemini_text_model)
-                        st.text_area("翻译结果（可复制）", zh, height=780, key="zh_translation_area_gemini")
-                    except Exception as e:
-                        st.error(f"翻译失败：{e}")
-                        st.caption("检查：是否已设置 GEMINI_API_KEY / GOOGLE_API_KEY（环境变量或 Streamlit Secrets）？")
+                provider = st.radio("翻译引擎", ["Gemini", "OpenAI"], horizontal=True, index=0)
+                style = st.text_input("翻译风格（可选）", value="")
+
+                if provider == "Gemini":
+                    if not GEMINI_AVAILABLE:
+                        st.error("未安装 google-genai：请 pip install google-genai")
+                    else:
+                        gemini_model = st.text_input("Gemini 翻译模型", value="gemini-2.0-flash")
+                        if st.button("翻译当前页（Gemini）", use_container_width=True):
+                            try:
+                                with st.spinner("正在翻译（Gemini）…"):
+                                    zh = translate_en_to_zh_gemini(src_text, model=gemini_model, style=style)
+                                st.text_area("翻译结果（可复制）", zh, height=780, key="zh_gemini")
+                            except Exception as e:
+                                st.error(f"翻译失败：{e}")
+                                st.caption("检查：是否已设置 GEMINI_API_KEY / GOOGLE_API_KEY（环境变量或 Streamlit Secrets）？")
                 else:
-                    st.text_area("原文（将用于翻译）", src_text, height=300, key="src_text_area_gemini")
-                    if st.button("翻译此页（Gemini）", use_container_width=True, key="btn_translate_gemini"):
-                        try:
-                            with st.spinner("正在翻译（Gemini）…"):
-                                zh = translate_en_to_zh_gemini(src_text, model=gemini_text_model)
-                            st.text_area("翻译结果（可复制）", zh, height=460, key="zh_area_gemini_manual")
-                        except Exception as e:
-                            st.error(f"翻译失败：{e}")
-                            st.caption("检查：是否已设置 GEMINI_API_KEY / GOOGLE_API_KEY（环境变量或 Streamlit Secrets）？")
-
-
-
+                    if not OPENAI_AVAILABLE:
+                        st.error("未安装 openai：请 pip install openai")
+                    else:
+                        openai_model = st.text_input("OpenAI 翻译模型", value="gpt-4o-mini")
+                        if st.button("翻译当前页（OpenAI）", use_container_width=True):
+                            try:
+                                with st.spinner("正在翻译（OpenAI）…"):
+                                    zh = translate_en_to_zh_openai(src_text, model=openai_model)
+                                st.text_area("翻译结果（可复制）", zh, height=780, key="zh_openai")
+                            except Exception as e:
+                                st.error(f"翻译失败：{e}")
+                                st.caption("检查：是否已设置 OPENAI_API_KEY？")
 
 else:
-    # HTML mode
     speech_lang = "en-US" if (book.get("language", "").lower().startswith("en")) else "zh-CN"
     full_html = wrap_reader_html(
         body_html=chapter_body_html,
@@ -1033,49 +998,9 @@ else:
     )
     components.html(full_html, height=900, scrolling=True)
 
-
-with colR:
-    st.markdown("#### 中文翻译（Gemini）")
-
-    # 仅当疑似英文时才翻译（你原先如果有检测逻辑，保留即可）
-    if not is_english:
-        st.info("检测到本页不像英文，未自动翻译。")
-        st.text_area("内容", src_text, height=780, key="not_en_text_area")
-    else:
-        # 选择 Gemini 翻译模型（建议用文本模型，不要用 TTS 模型）
-        gemini_text_model = st.sidebar.text_input(
-            "翻译模型（Gemini）",
-            value="gemini-2.5-flash",
-            key="gemini_translate_model",
-        )
-
-        # 自动翻译开关
-        if st.sidebar.checkbox("自动翻译当前页", value=True, key="gemini_auto_translate_ck"):
-            try:
-                with st.spinner("正在翻译（Gemini）…"):
-                    zh = translate_en_to_zh_gemini(src_text, model=gemini_text_model)
-                st.text_area("翻译结果（可复制）", zh, height=780, key="zh_translation_area_gemini")
-            except Exception as e:
-                st.error(f"翻译失败：{e}")
-                st.caption("检查：是否已设置 GEMINI_API_KEY / GOOGLE_API_KEY（环境变量或 Streamlit Secrets）？")
-        else:
-            st.text_area("原文（将用于翻译）", src_text, height=300, key="src_text_area_gemini")
-            if st.button("翻译此页（Gemini）", use_container_width=True, key="btn_translate_gemini"):
-                try:
-                    with st.spinner("正在翻译（Gemini）…"):
-                        zh = translate_en_to_zh_gemini(src_text, model=gemini_text_model)
-                    st.text_area("翻译结果（可复制）", zh, height=460, key="zh_area_gemini_manual")
-                except Exception as e:
-                    st.error(f"翻译失败：{e}")
-                    st.caption("检查：是否已设置 GEMINI_API_KEY / GOOGLE_API_KEY（环境变量或 Streamlit Secrets）？")
-
-
-
-
-
-# -----------------------------
+# ============================================================
 # Optional: TTS (Edge -> MP3)
-# -----------------------------
+# ============================================================
 with st.expander("生成本章 MP3（Edge TTS，可下载）", expanded=False):
     if not EDGE_TTS_AVAILABLE:
         st.info("未安装 edge-tts：运行 `pip install edge-tts` 后重启 Streamlit。")
@@ -1136,14 +1061,14 @@ with st.expander("生成本章 MP3（Edge TTS，可下载）", expanded=False):
                     use_container_width=True,
                 )
 
-# -----------------------------
+# ============================================================
 # Optional: Google Gemini TTS (Kore etc.) -> WAV playback
-# -----------------------------
+# ============================================================
 with st.expander("在线朗读（Google Gemini TTS：Kore 等，播放 WAV，不生成 MP3）", expanded=False):
     if not GEMINI_AVAILABLE:
         st.info("未安装 google-genai：运行 `pip install google-genai` 后重启。")
     else:
-        st.caption("需要设置 GEMINI_API_KEY 或 GOOGLE_API_KEY（环境变量）。")
+        st.caption("需要设置 GEMINI_API_KEY 或 GOOGLE_API_KEY（环境变量或 Streamlit Secrets）。")
         voice = st.selectbox("Google 声音（预置）", ["Kore", "Zephyr", "Puck", "Charon", "Fenrir"], index=0)
         model = st.text_input("Gemini TTS 模型", value="gemini-2.5-flash-preview-tts")
         style = st.text_input("风格指令（可选）", value="请用温柔、自然、略慢的语气朗读：")
@@ -1156,145 +1081,11 @@ with st.expander("在线朗读（Google Gemini TTS：Kore 等，播放 WAV，不
             count = st.number_input("朗读多少段", min_value=1, max_value=min(40, len(blocks)), value=min(8, len(blocks)), step=1)
             tts_text = "\n\n".join(b["text"] for b in blocks[int(start_idx) - 1: int(start_idx) - 1 + int(count)])
 
-            if st.button("生成并播放（Google）", use_container_width=True):
+            if st.button("生成并播放（Gemini TTS）", use_container_width=True):
                 try:
                     with st.spinner("正在生成音频（WAV）…"):
                         wav_bytes = gemini_tts_wav(tts_text, voice_name=voice, model=model, style=style)
                     st.audio(wav_bytes, format="audio/wav")
                 except Exception as e:
                     st.error(f"生成失败：{e}")
-                    st.caption("检查：是否已设置 GEMINI_API_KEY / GOOGLE_API_KEY，且模型名称可用。")
-
-
-st.subheader("浏览器实时朗读（兜底模式：选段落起点）")
-
-blocks = extract_chapter_blocks(epub_bytes, book, st.session_state.chapter_idx)
-if blocks:
-    start_idx = st.number_input("从第几段开始", 1, len(blocks), 1, 1)
-    count = st.number_input("朗读多少段", 1, min(50, len(blocks)), min(8, len(blocks)), 1)
-    tts_text = "\n\n".join(b["text"] for b in blocks[int(start_idx)-1:int(start_idx)-1+int(count)])
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("开始朗读（浏览器）", use_container_width=True):
-            components.html(
-                f"""
-                <script>
-                  const text = {json.dumps(tts_text)};
-                  speechSynthesis.cancel();
-                  const u = new SpeechSynthesisUtterance(text);
-                  u.lang = "zh-CN";
-                  u.rate = 1.0;
-                  speechSynthesis.speak(u);
-                </script>
-                """,
-                height=0
-            )
-    with col2:
-        if st.button("停止朗读（浏览器）", use_container_width=True):
-            components.html("<script>speechSynthesis.cancel();</script>", height=0)
-else:
-    st.info("本章没有可朗读的段落。")
-
-
-
-try:
-    from google.cloud import texttospeech
-    GCP_TTS_AVAILABLE = True
-except Exception:
-    GCP_TTS_AVAILABLE = False
-
-@st.cache_data(show_spinner=False)
-def chirp3_hd_tts_mp3(text: str, voice_name: str = "cmn-CN-Chirp3-HD-Kore") -> bytes:
-    if not GCP_TTS_AVAILABLE:
-        raise RuntimeError("未安装 google-cloud-texttospeech")
-
-    client = texttospeech.TextToSpeechClient()
-
-    synthesis_input = texttospeech.SynthesisInput(text=text)
-
-    voice = texttospeech.VoiceSelectionParams(
-        language_code="cmn-CN",
-        name=voice_name,
-    )
-
-    audio_config = texttospeech.AudioConfig(
-        audio_encoding=texttospeech.AudioEncoding.MP3
-    )
-
-    resp = client.synthesize_speech(
-        input=synthesis_input,
-        voice=voice,
-        audio_config=audio_config,
-    )
-    return resp.audio_content
-
-
-
-with st.expander("在线朗读（Google Chirp 3 HD：中文 Kore / Vindemiatrix 等）", expanded=True):
-    if not GCP_TTS_AVAILABLE:
-        st.info("未安装 google-cloud-texttospeech；并且需要配置 Google Cloud 凭据（GOOGLE_APPLICATION_CREDENTIALS）。")
-    else:
-        voice_map = {
-            "Kore（偏清晰/坚定）": "cmn-CN-Chirp3-HD-Kore",
-            "Vindemiatrix（Gentle，更温柔）": "cmn-CN-Chirp3-HD-Vindemiatrix",
-            "Zephyr（更明亮）": "cmn-CN-Chirp3-HD-Zephyr",
-            "Puck（更活泼）": "cmn-CN-Chirp3-HD-Puck",
-            "Charon（更信息播报感）": "cmn-CN-Chirp3-HD-Charon",
-        }
-        label = st.selectbox("选择声音", list(voice_map.keys()), index=1)
-        voice_name = voice_map[label]
-
-        blocks = extract_chapter_blocks(epub_bytes, book, st.session_state.chapter_idx)
-        start_idx = st.number_input("从第几段开始", 1, len(blocks), 1, 1)
-        count = st.number_input("朗读多少段", 1, min(40, len(blocks)), min(8, len(blocks)), 1)
-        tts_text = "\n\n".join(b["text"] for b in blocks[int(start_idx)-1:int(start_idx)-1+int(count)])
-
-        if st.button("生成并播放（Chirp3 HD）", use_container_width=True):
-            with st.spinner("生成音频…"):
-                mp3 = chirp3_hd_tts_mp3(tts_text, voice_name=voice_name)
-            st.audio(mp3, format="audio/mp3")
-
-
-
-
-@st.cache_data(show_spinner=False)
-def translate_en_to_zh_gemini(text: str, model: str = "gemini-2.0-flash", style: str = "") -> str:
-    """
-    Gemini 翻译：英文 -> 简体中文
-    依赖：google-genai
-    环境变量：GEMINI_API_KEY 或 GOOGLE_API_KEY
-    """
-    if not GEMINI_AVAILABLE:
-        raise RuntimeError("google-genai 未安装：请 pip install google-genai")
-
-    client = genai.Client()
-
-    prompt = (
-        "请把下面英文翻译成简体中文。\n"
-        "要求：\n"
-        "1) 尽量逐段对应（保留段落换行）。\n"
-        "2) 不要添加解释、注释或多余内容。\n"
-        "3) 保持人名/地名一致。\n"
-        "4) 语气自然，保留原文风格。\n"
-    )
-    if style.strip():
-        prompt += f"\n额外风格要求：{style.strip()}\n"
-    prompt += "\n---\n" + text
-
-    resp = client.models.generate_content(
-        model=model,
-        contents=prompt,
-    )
-
-    # google-genai 的响应通常在 resp.text
-    out = getattr(resp, "text", None)
-    if out and out.strip():
-        return out.strip()
-
-    # 兜底：从 candidates 里取
-    try:
-        return resp.candidates[0].content.parts[0].text.strip()
-    except Exception:
-        raise RuntimeError("Gemini 返回格式异常，未能提取文本。")
-
+                    st.caption("检查：Key 是否设置、模型名称是否可用。")
