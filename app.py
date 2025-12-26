@@ -1,14 +1,12 @@
 import os
-import asyncio
 import base64
 import hashlib
 import io
 import re
-import threading
 import wave
 import zipfile
 import xml.etree.ElementTree as ET
-import urllib.parse
+import posixpath
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -35,9 +33,8 @@ except ImportError:
 # ============================================================
 st.set_page_config(page_title="EPUB AI Reader", layout="wide")
 
-# 固定模型配置，防止混用
-TTS_MODEL_ID = "gemini-2.5-flash-preview-tts"  # 专用语音模型
-TEXT_MODEL_ID = "gemini-2.0-flash"             # 专用文本/翻译模型
+TTS_MODEL_ID = "gemini-2.5-flash-preview-tts"
+TEXT_MODEL_ID = "gemini-2.0-flash"
 
 # ============================================================
 # 辅助函数
@@ -46,8 +43,6 @@ def normalize_zip_path(path: str) -> str:
     path = (path or "").replace("\\", "/")
     path = re.sub(r"^\./", "", path)
     return posixpath.normpath(path)
-
-import posixpath
 
 def resolve_href(base_dir: str, href: str):
     href = (href or "").strip()
@@ -63,13 +58,6 @@ def decode_bytes(b: bytes) -> str:
         try: return b.decode(enc)
         except UnicodeDecodeError: continue
     return b.decode("latin-1", errors="ignore")
-
-def guess_mime(path: str) -> str:
-    ext = path.lower().rsplit(".", 1)[-1] if "." in path else ""
-    return {
-        "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-        "gif": "image/gif", "svg": "image/svg+xml", "webp": "image/webp"
-    }.get(ext, "application/octet-stream")
 
 def soup_html(html: str) -> BeautifulSoup:
     try: return BeautifulSoup(html, "lxml")
@@ -91,8 +79,54 @@ def get_secret(*names: str) -> str:
     return ""
 
 # ============================================================
-# EPUB 解析核心
+# EPUB 解析
 # ============================================================
+def parse_nav_toc(z: zipfile.ZipFile, nav_path: str):
+    try:
+        html = decode_bytes(z.read(nav_path))
+        soup = soup_html(html)
+        nav = soup.find("nav", attrs={"epub:type": "toc"}) or soup.find("nav", attrs={"role": "doc-toc"})
+        if not nav:
+            for cand in soup.find_all("nav"):
+                if "toc" in str(cand.get("epub:type") or cand.get("type") or "").lower():
+                    nav = cand
+                    break
+        toc_dir = posixpath.dirname(nav_path)
+        entries = []
+        if nav:
+            for a in nav.select("a[href]"):
+                title = a.get_text(" ", strip=True) or "Untitled"
+                href = a.get("href", "")
+                path, frag = resolve_href(toc_dir, href)
+                if path: entries.append({"title": title, "path": path})
+        return entries
+    except:
+        return []
+
+def parse_ncx_toc(z: zipfile.ZipFile, ncx_path: str):
+    try:
+        root = ET.fromstring(z.read(ncx_path))
+        toc_dir = posixpath.dirname(ncx_path)
+        entries = []
+        def walk(node):
+            for child in list(node):
+                if isinstance(child.tag, str) and child.tag.endswith("navPoint"):
+                    title, src = None, None
+                    for el in child.iter():
+                        if not title and isinstance(el.tag, str) and el.tag.endswith("text"):
+                            if el.text and el.text.strip(): title = el.text.strip()
+                        if not src and isinstance(el.tag, str) and el.tag.endswith("content"):
+                            src = el.attrib.get("src")
+                    if src:
+                        path, frag = resolve_href(toc_dir, src)
+                        if path: entries.append({"title": title or "Untitled", "path": path})
+                    walk(child)
+        navmap = next((e for e in root.iter() if isinstance(e.tag, str) and e.tag.endswith("navMap")), root)
+        walk(navmap)
+        return entries
+    except:
+        return []
+
 @st.cache_data(show_spinner=False)
 def parse_epub(epub_bytes: bytes):
     z = zipfile.ZipFile(io.BytesIO(epub_bytes))
@@ -120,13 +154,17 @@ def parse_epub(epub_bytes: bytes):
         for item in list(manifest_el):
             if item.tag.endswith("item"):
                 iid, href = item.attrib.get("id"), item.attrib.get("href")
+                media_type = item.attrib.get("media-type", "")
+                props = item.attrib.get("properties", "")
                 if iid and href:
                     path = normalize_zip_path(posixpath.join(opf_dir, href))
-                    manifest[iid] = {"href": href, "path": path, "media_type": item.attrib.get("media-type", "")}
+                    manifest[iid] = {"href": href, "path": path, "media_type": media_type, "properties": props}
 
     # Spine
     spine_el = next((e for e in opf_root.iter() if e.tag.endswith("spine")), None)
     spine_paths = []
+    ncx_id = spine_el.attrib.get("toc") if spine_el is not None else None
+    
     if spine_el is not None:
         for itemref in list(spine_el):
             if itemref.tag.endswith("itemref"):
@@ -136,8 +174,22 @@ def parse_epub(epub_bytes: bytes):
                     if "html" in (m.get("media_type") or "").lower() and m["path"] in file_list:
                         spine_paths.append(m["path"])
 
-    # Simple TOC
-    chapter_titles = [f"Chapter {i+1}" for i in range(len(spine_paths))] # 简化处理，避免解析复杂toc导致报错
+    # Try Parse TOC
+    nav_path = next((m["path"] for m in manifest.values() if "nav" in (m.get("properties") or "").split()), None)
+    ncx_path = manifest[ncx_id]["path"] if ncx_id and ncx_id in manifest else None
+    
+    toc_entries = []
+    if nav_path and nav_path in file_list: toc_entries = parse_nav_toc(z, nav_path)
+    elif ncx_path and ncx_path in file_list: toc_entries = parse_ncx_toc(z, ncx_path)
+    
+    # Map TOC to chapters
+    chapter_titles = [f"第 {i+1} 章" for i in range(len(spine_paths))]
+    path_to_idx = {p: i for i, p in enumerate(spine_paths)}
+    
+    for e in toc_entries:
+        if e["path"] in path_to_idx:
+            idx = path_to_idx[e["path"]]
+            chapter_titles[idx] = e["title"]
 
     return {
         "title": title,
@@ -155,7 +207,6 @@ def extract_chapter_blocks(epub_bytes: bytes, book: dict, chapter_idx: int, embe
     body = soup.body or soup
     for s in body.find_all("script"): s.decompose()
     
-    # 图片嵌入
     if embed_images:
         base_dir = posixpath.dirname(path)
         for img in body.find_all("img"):
@@ -168,23 +219,17 @@ def extract_chapter_blocks(epub_bytes: bytes, book: dict, chapter_idx: int, embe
                 img["src"] = f"data:{mime};base64,{b64}"
 
     blocks = []
-    # 提取顶层块级元素
     for el in body.find_all(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "div"]):
-        # 简单防重：如果父级已经是我们提取过的块，跳过子级
-        # 但这里为了简单，只提取有实际文本的叶子或近叶子节点
         text = el.get_text(" ", strip=True)
+        # 只取有内容的块，且不取仅仅包含图片的块(除非有alt)
         if len(text) > 1:
-            # 检查这个元素是否包含其他块级元素，如果包含则跳过（避免重复）
-            if el.find(["p", "div", "li"]):
-                continue
-            
+            if el.find(["p", "div", "li", "h1", "h2"]): continue # 简单防嵌套
             blocks.append({
                 "text": text,
-                "html": str(el), # 原始 HTML
+                "html": str(el), # 保留 HTML 标签
                 "tag": el.name
             })
             
-    # 如果没提取到，兜底
     if not blocks:
         txt = body.get_text("\n", strip=True)
         parts = [p for p in txt.split('\n') if p.strip()]
@@ -194,7 +239,7 @@ def extract_chapter_blocks(epub_bytes: bytes, book: dict, chapter_idx: int, embe
     return blocks
 
 # ============================================================
-# Gemini API 调用
+# AI 核心
 # ============================================================
 def pcm16_to_wav_bytes(pcm: bytes, rate: int = 24000) -> bytes:
     buf = io.BytesIO()
@@ -207,14 +252,11 @@ def pcm16_to_wav_bytes(pcm: bytes, rate: int = 24000) -> bytes:
 
 @st.cache_data(show_spinner=False)
 def gemini_translate(text: str, style: str) -> str:
-    """必须使用 gemini-2.0-flash (文本模型)"""
     if not GEMINI_AVAILABLE: return "Error: 库未安装"
     api_key = get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY")
     client = genai.Client(api_key=api_key)
-    
     prompt = f"Translate the following text to Simplified Chinese.\nStyle: {style}\n\n{text}"
     try:
-        # 强制使用文本模型
         resp = client.models.generate_content(model=TEXT_MODEL_ID, contents=prompt)
         return resp.text.strip()
     except Exception as e:
@@ -222,17 +264,13 @@ def gemini_translate(text: str, style: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def gemini_tts(text: str, voice: str) -> bytes:
-    """必须使用 gemini-2.5-flash-preview-tts (语音模型)"""
     if not GEMINI_AVAILABLE: return b""
     api_key = get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY")
     client = genai.Client(api_key=api_key)
-    
-    safe_text = text[:4000] # 长度保护
-    
     try:
         resp = client.models.generate_content(
             model=TTS_MODEL_ID,
-            contents=safe_text,
+            contents=text[:4000],
             config=genai_types.GenerateContentConfig(
                 response_modalities=["AUDIO"],
                 speech_config=genai_types.SpeechConfig(
@@ -249,103 +287,95 @@ def gemini_tts(text: str, voice: str) -> bytes:
         print(f"TTS Error: {e}")
         return b""
 
+@st.cache_data(show_spinner=False)
+def translate_en_to_zh_openai(text: str) -> str:
+    if not OPENAI_AVAILABLE: return "Error: openai not installed."
+    client = OpenAI()
+    prompt = f"Translate to Simplified Chinese. Keep paragraphs.\n\n{text}"
+    try:
+        resp = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}])
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"OpenAI Error: {e}"
+
 # ============================================================
-# UI 渲染 (关键修改：使用原生 Link 触发)
+# UI 渲染 (修复缩进问题)
 # ============================================================
 def render_clickable_blocks(blocks, current_play_idx, theme):
-    """
-    使用 st.markdown 渲染 HTML。
-    核心技巧：将文本包裹在 <a href="?play_idx=X" target="_self"> 中。
-    点击链接 = 刷新页面 = 触发 Python 逻辑。
-    """
-    
-    # 颜色配置
     text_color = "#e6e6e6" if theme == "Dark" else "#111111"
-    link_color = text_color # 让链接看起来像普通文字
     hover_bg = "rgba(255,255,255,0.1)" if theme == "Dark" else "rgba(0,0,0,0.05)"
     active_bg = "rgba(255, 200, 100, 0.3)" if theme == "Dark" else "rgba(255, 230, 0, 0.4)"
     
-    html_parts = []
-    
-    # CSS 样式
-    html_parts.append(f"""
+    # CSS: 定义链接样式，使其看起来像块级元素
+    css = f"""
     <style>
     .block-link {{
-        display: block;
-        text-decoration: none;
+        display: block !important;
+        text-decoration: none !important;
         color: {text_color} !important;
         padding: 6px 10px;
         margin-bottom: 8px;
         border-radius: 4px;
-        transition: background 0.15s;
         border-left: 3px solid transparent;
+        transition: background 0.1s;
     }}
     .block-link:hover {{
         background-color: {hover_bg};
         border-left: 3px solid #888;
-        text-decoration: none !important;
     }}
     .block-active {{
         background-color: {active_bg} !important;
-        border-left: 3px solid #f60;
+        border-left: 3px solid #f60 !important;
     }}
-    .reader-img {{ max-width: 100%; height: auto; display: block; margin: 10px auto; }}
+    /* 让原有的 p 标签样式不干扰链接 */
+    .block-link p, .block-link div, .block-link h1, .block-link h2 {{
+        margin: 0; padding: 0; color: inherit;
+    }}
     </style>
-    """)
+    """
+    
+    html_list = [css]
     
     for i, block in enumerate(blocks):
-        is_active = (i == current_play_idx)
-        active_class = "block-active" if is_active else ""
+        active_class = "block-active" if i == current_play_idx else ""
+        content = block["html"].strip()
+        # 核心修复：单行拼接，无缩进，避免 Markdown 识别为代码块
+        link = f'<a href="?play_idx={i}" target="_self" class="block-link {active_class}" id="blk-{i}">{content}</a>'
+        html_list.append(link)
         
-        # 提取 HTML 内容 (去除原有的 p 标签，因为我们要用 a 标签包裹)
-        content = block["html"]
-        # 简单的清理，防止嵌套非法 (a 里面不能套 div/p 在某些 DOCTYPE 下，但在 HTML5 流式内容中通常浏览器能容忍)
-        # 为了安全，我们只取内容文本或者 innerHTML
-        # 这里直接用 block['text'] 最安全，如果需要保留加粗等格式，需要更精细的处理。
-        # 为了保留原书格式（粗体/斜体），我们直接包裹 block["html"]。
-        # 浏览器通常允许 <a style="display:block">...</a>
-        
-        # 构造链接。注意 target="_self" 是关键，强制在当前页刷新
-        link = f"""
-        <a href="?play_idx={i}" target="_self" class="block-link {active_class}" id="blk-{i}">
-            {content}
-        </a>
-        """
-        html_parts.append(link)
-        
-    return "\n".join(html_parts)
+    return "".join(html_list)
 
 # ============================================================
-# 主程序
+# Main
 # ============================================================
 def main():
-    # 1. 获取 URL 参数 (Streamlit 1.30+ 用 st.query_params)
     query = st.query_params
     play_idx_str = query.get("play_idx", None)
     current_play_idx = int(play_idx_str) if play_idx_str is not None else None
 
     with st.sidebar:
-        st.header("📖 1. 文件")
-        uploaded = st.file_uploader("EPUB 上传", type=["epub"])
+        st.header("📖 EPUB AI Reader")
+        uploaded = st.file_uploader("上传文件", type=["epub"])
         
         st.divider()
-        st.header("🔊 2. Gemini 朗读")
-        if not GEMINI_AVAILABLE: st.error("请安装 google-genai")
-        
+        st.subheader("🔊 朗读 (Gemini)")
         voice = st.selectbox("声音", ["Kore", "Zephyr", "Puck", "Charon", "Fenrir"], index=0)
         speed = st.slider("语速", 0.5, 2.0, 1.25, 0.1)
         auto_next = st.checkbox("自动连播", value=True)
         
         st.divider()
-        st.header("👁️ 3. 显示")
+        st.subheader("🛠️ 设置")
         view_mode = st.radio("模式", ["点击朗读", "对照翻译"], index=0)
+        if view_mode == "对照翻译":
+            trans_engine = st.radio("翻译引擎", ["Gemini", "OpenAI"], horizontal=True)
+        
         theme = st.radio("主题", ["Light", "Dark"], index=1, horizontal=True)
 
     if not uploaded:
-        st.info("请先上传 EPUB。")
+        st.info("👈 请在左侧上传 EPUB 文件。")
         st.stop()
         
-    # 解析文件
+    # 解析
     epub_bytes = uploaded.getvalue()
     book_hash = hashlib.sha256(epub_bytes).hexdigest()
     
@@ -354,156 +384,136 @@ def main():
             st.session_state.book = parse_epub(epub_bytes)
             st.session_state.book_hash = book_hash
             st.session_state.chapter_idx = 0
-            st.query_params.clear() # 重置参数
+            st.query_params.clear()
         except Exception as e:
             st.error(f"解析失败: {e}")
             st.stop()
             
     book = st.session_state.book
     
-    # 章节导航
+    # 导航
     col1, col2, col3 = st.columns([1, 4, 1])
     with col1:
-        if st.button("⬅️", use_container_width=True):
+        if st.button("⬅️ 上一章", use_container_width=True):
             st.session_state.chapter_idx = max(0, st.session_state.chapter_idx - 1)
             st.query_params.clear()
             st.rerun()
     with col2:
         chap_list = book["chapter_titles"]
-        new_chap = st.selectbox("当前章节", range(len(chap_list)), 
-                                index=st.session_state.chapter_idx, 
+        curr_idx = st.session_state.chapter_idx
+        # 确保索引不越界（防御性编程）
+        if curr_idx >= len(chap_list): curr_idx = 0
+        
+        new_chap = st.selectbox("章节", range(len(chap_list)), 
+                                index=curr_idx, 
                                 format_func=lambda i: chap_list[i], 
                                 label_visibility="collapsed")
-        if new_chap != st.session_state.chapter_idx:
+        if new_chap != curr_idx:
             st.session_state.chapter_idx = new_chap
             st.query_params.clear()
             st.rerun()
     with col3:
-        if st.button("➡️", use_container_width=True):
+        if st.button("下一章 ➡️", use_container_width=True):
             st.session_state.chapter_idx = min(len(chap_list)-1, st.session_state.chapter_idx + 1)
             st.query_params.clear()
             st.rerun()
 
-    # 提取当前章节内容
+    # 内容
     blocks = extract_chapter_blocks(epub_bytes, book, st.session_state.chapter_idx, embed_images=True)
     
-    # --------------------------------------------------------
-    # 音频处理逻辑 (如果在播放状态)
-    # --------------------------------------------------------
+    # 音频播放
     if current_play_idx is not None and 0 <= current_play_idx < len(blocks):
-        # 自动滚动到当前播放位置 (通过 HTML anchor)
-        target_block = blocks[current_play_idx]
-        text_to_speak = target_block["text"]
-        
-        # 生成音频 (使用专门的语音模型)
-        if text_to_speak.strip():
-            # 显示一个固定的播放栏在顶部
-            wav_bytes = gemini_tts(text_to_speak, voice)
-            
-            if wav_bytes:
-                b64_audio = base64.b64encode(wav_bytes).decode()
-                
-                # 下一段的 URL
-                next_url = ""
+        target_text = blocks[current_play_idx]["text"]
+        if target_text.strip():
+            wav = gemini_tts(target_text, voice)
+            if wav:
+                b64 = base64.b64encode(wav).decode()
+                next_js = ""
                 if auto_next and current_play_idx + 1 < len(blocks):
-                    # 构造下一段的 query string
-                    # 注意：这里需要全路径或者相对路径，Streamlit 重载通常在根路径
                     next_url = f"?play_idx={current_play_idx + 1}"
+                    next_js = f"""
+                    aud.onended = function() {{
+                        window.parent.location.search = "{next_url}";
+                    }};
+                    """
                 
-                # 播放器 HTML (原生 Audio + JS 监听结束跳转)
-                # 放在 st.markdown 中，位置固定在底部
+                # 播放器组件
                 player_html = f"""
-                <div style="position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); 
-                            background: #222; padding: 10px 20px; border-radius: 30px; 
-                            box-shadow: 0 4px 15px rgba(0,0,0,0.5); z-index: 99999; display: flex; align-items: center; gap: 10px;">
-                    <span style="color: #fff; font-size: 14px; font-weight: bold;">
-                        ▶ 正在朗读 ({current_play_idx + 1}/{len(blocks)})
-                    </span>
-                    <audio id="global-player" controls autoplay style="height: 30px;">
-                        <source src="data:audio/wav;base64,{b64_audio}" type="audio/wav">
+                <div style="position:fixed; bottom:20px; left:50%; transform:translateX(-50%); 
+                            background:#222; padding:8px 15px; border-radius:30px; 
+                            box-shadow:0 5px 20px rgba(0,0,0,0.5); z-index:99999; display:flex; align-items:center; gap:10px;">
+                    <span style="color:#fff; font-size:14px; white-space:nowrap;">▶ ({current_play_idx + 1}/{len(blocks)})</span>
+                    <audio id="player" controls autoplay style="height:30px;">
+                        <source src="data:audio/wav;base64,{b64}" type="audio/wav">
                     </audio>
                 </div>
                 <script>
-                    var aud = document.getElementById("global-player");
-                    if (aud) {{
-                        aud.playbackRate = {speed};
-                        aud.onended = function() {{
-                            if ("{next_url}" !== "") {{
-                                window.parent.location.search = "{next_url}";
-                            }}
-                        }};
-                    }}
+                    var aud = document.getElementById("player");
+                    aud.playbackRate = {speed};
+                    {next_js}
                 </script>
                 """
-                components.html(player_html, height=0) # 0高度不可见iframe，但其中的fixed元素可见
+                components.html(player_html, height=0)
 
-    # --------------------------------------------------------
-    # 主视图渲染
-    # --------------------------------------------------------
-    
+    # 视图渲染
     if view_mode == "点击朗读":
-        # 使用 Markdown + HTML 渲染
-        # 这是修复点击卡顿的关键：直接把文字变成链接
-        st.caption("提示：点击任意段落，Gemini 将从该处开始朗读。")
-        
+        st.caption("提示：点击段落即可朗读。")
         html_content = render_clickable_blocks(blocks, current_play_idx, theme)
+        bg = "#0e1117" if theme == "Dark" else "#ffffff"
         
-        # 容器背景色
-        bg_color = "#0e1117" if theme == "Dark" else "#ffffff"
+        # 修复：移除 f-string 内部的缩进，防止被当做代码块
+        st.markdown(f'<div style="background-color:{bg}; padding:20px; border-radius:8px; max-width:800px; margin:0 auto;">{html_content}</div>', unsafe_allow_html=True)
         
-        st.markdown(f"""
-        <div style="background-color:{bg_color}; padding: 20px; border-radius: 10px; max-width: 800px; margin: 0 auto;">
-            {html_content}
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # 尝试 JS 滚动 (如果刚加载页面)
+        # 滚动 JS
         if current_play_idx is not None:
-             # 这段 JS 尝试把视图滚动到 id="blk-{idx}" 的元素
-             components.html(f"""
-             <script>
-                setTimeout(function(){{
-                    var el = window.parent.document.getElementById('blk-{current_play_idx}');
-                    if(el) el.scrollIntoView({{behavior: "smooth", block: "center"}});
-                }}, 500);
-             </script>
-             """, height=0)
+             components.html(f"<script>setTimeout(function(){{var el=window.parent.document.getElementById('blk-{current_play_idx}');if(el)el.scrollIntoView({{behavior:'smooth',block:'center'}});}},500);</script>", height=0)
 
-    else: # 对照翻译模式
-        st.caption("👈 点击左侧 **翻译当前页** 按钮查看译文。")
-        
-        # 分页逻辑
+    else: # 翻译模式
+        st.caption("左侧点击段落可朗读，右侧点击按钮翻译。")
         per_page = 10
-        total_pages = (len(blocks) + per_page - 1) // per_page
-        if total_pages == 0: total_pages = 1
-        
+        total_pages = max(1, (len(blocks) + per_page - 1) // per_page)
         page = st.number_input("页码", 1, total_pages, 1) - 1
         
-        start = page * per_page
-        end = start + per_page
-        page_blocks = blocks[start:end]
+        chunk = blocks[page*per_page : (page+1)*per_page]
         
         colL, colR = st.columns(2)
-        
-        src_text = "\n\n".join([b["text"] for b in page_blocks])
-        src_html = "\n".join([b["html"] for b in page_blocks])
-        
         with colL:
-            st.markdown("### 原文")
-            st.markdown(f"<div style='opacity:0.9'>{src_html}</div>", unsafe_allow_html=True)
+            # 这里的左侧我们也用 render_clickable_blocks 渲染，支持点击朗读
+            # 但是要调整 index 偏移
+            # 我们需要造一个临时的 blocks 列表，但是 ID 必须对应全局 index
+            # render_clickable_blocks 内部是 enumerate(blocks)，所以我们不能直接传 chunk
+            # 而是要手动生成 HTML
             
+            # 手动生成左侧 HTML
+            left_html_parts = []
+            # 引入样式
+            left_html_parts.append(render_clickable_blocks([], None, theme)) #只拿css
+            
+            for i, block in enumerate(chunk):
+                real_idx = page * per_page + i
+                active_class = "block-active" if real_idx == current_play_idx else ""
+                content = block["html"].strip()
+                link = f'<a href="?play_idx={real_idx}" target="_self" class="block-link {active_class}" id="blk-{real_idx}">{content}</a>'
+                left_html_parts.append(link)
+            
+            full_left = "".join(left_html_parts)
+            bg = "#0e1117" if theme == "Dark" else "#ffffff"
+            st.markdown(f'<div style="background-color:{bg}; padding:10px;">{full_left}</div>', unsafe_allow_html=True)
+
         with colR:
-            st.markdown("### 译文")
-            if st.button("翻译当前页 (Gemini)", use_container_width=True, key=f"trans_{page}"):
-                with st.spinner("Gemini 正在翻译..."):
-                    # 此时肯定调用的是 TEXT_MODEL_ID
-                    res = gemini_translate(src_text, style="流畅、文学")
-                    if "Error" in res: st.error(res)
-                    else: st.success("翻译完成")
-                    st.session_state[f"trans_res_{page}"] = res
+            src_text = "\n\n".join([b["text"] for b in chunk])
+            if st.button("翻译当前页", key=f"btn_trans_{page}", use_container_width=True):
+                with st.spinner("翻译中..."):
+                    if trans_engine == "Gemini":
+                        res = gemini_translate(src_text, "文学流畅")
+                    else:
+                        res = translate_en_to_zh_openai(src_text)
+                st.session_state[f"trans_{page}"] = res
             
-            if f"trans_res_{page}" in st.session_state:
-                st.markdown(st.session_state[f"trans_res_{page}"])
+            if f"trans_{page}" in st.session_state:
+                st.info(st.session_state[f"trans_{page}"])
+            else:
+                st.text_area("原文预览", src_text, height=600, disabled=True)
 
 if __name__ == "__main__":
     main()
