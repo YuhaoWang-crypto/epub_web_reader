@@ -1068,6 +1068,66 @@ if view_mode == "排版（HTML）" and tts_mode.startswith("Gemini"):
                     st.error(f"Gemini TTS 失败：{e}")
                     st.caption("若出现 429 RESOURCE_EXHAUSTED：说明配额/速率耗尽，需要稍后重试或启用计费。")
 
+
+# ============================================================
+# Edge TTS helpers (MP3)  - required for "生成本章 MP3" block
+# ============================================================
+def _chunk_text(text: str, max_chars: int = 3000):
+    paras = [p.strip() for p in re.split(r"\n{2,}|\r\n{2,}", text) if p.strip()]
+    chunks, buf = [], ""
+    for p in paras:
+        if not buf:
+            buf = p
+        elif len(buf) + 2 + len(p) <= max_chars:
+            buf += "\n\n" + p
+        else:
+            chunks.append(buf)
+            buf = p
+    if buf:
+        chunks.append(buf)
+
+    out = []
+    for c in chunks:
+        if len(c) <= max_chars:
+            out.append(c)
+        else:
+            for i in range(0, len(c), max_chars):
+                out.append(c[i:i + max_chars])
+    return out
+
+
+def _strip_id3_if_present(mp3_bytes: bytes) -> bytes:
+    # Remove ID3 header on concatenation to avoid repeated tags.
+    if len(mp3_bytes) < 10:
+        return mp3_bytes
+    if mp3_bytes[:3] != b"ID3":
+        return mp3_bytes
+    size_bytes = mp3_bytes[6:10]
+    size = ((size_bytes[0] & 0x7F) << 21) | ((size_bytes[1] & 0x7F) << 14) | ((size_bytes[2] & 0x7F) << 7) | (size_bytes[3] & 0x7F)
+    start = 10 + size
+    return mp3_bytes[start:] if start < len(mp3_bytes) else mp3_bytes
+
+
+async def edge_tts_mp3_from_text(text: str, voice: str, rate: str, pitch: str, volume: str) -> bytes:
+    audio = bytearray()
+    communicate = edge_tts.Communicate(text, voice=voice, rate=rate, pitch=pitch, volume=volume)
+    async for chunk in communicate.stream():
+        if chunk.get("type") == "audio":
+            audio.extend(chunk["data"])
+    return bytes(audio)
+
+
+async def edge_tts_mp3_long(text: str, voice: str, rate: str, pitch: str, volume: str, max_chars: int = 3000) -> bytes:
+    parts = _chunk_text(text, max_chars=max_chars)
+    out = bytearray()
+    for i, part in enumerate(parts):
+        mp3_part = await edge_tts_mp3_from_text(part, voice, rate, pitch, volume)
+        if i > 0:
+            mp3_part = _strip_id3_if_present(mp3_part)
+        out.extend(mp3_part)
+    return bytes(out)
+
+
 # ============================================================
 # Keep the existing optional blocks (unchanged)
 # ============================================================
