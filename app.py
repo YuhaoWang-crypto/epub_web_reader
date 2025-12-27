@@ -693,8 +693,7 @@ def build_gemini_clickable_body(blocks, current_idx: int | None):
         wrapped_html = f'<div class="para-wrap">{badge}{b["html"]}</div>'
 
         out.append(f'<a class="{cls}" target="_top" href="?tts_start={i}">{wrapped_html}</a>')
-    return "
-".join(out)
+    return "\n".join(out)
 
 
 
