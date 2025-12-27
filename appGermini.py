@@ -182,8 +182,15 @@ def merge_blocks_into_chunks(raw_blocks, max_chars=800):
     return chunks
 
 # ============================================================
-# AI 逻辑 
+# AI 逻辑 (含静音填充)
 # ============================================================
+def add_silence_padding(pcm: bytes, duration_sec: float = 0.5, rate: int = 24000) -> bytes:
+    """在音频开头添加静音，防止开头吞字"""
+    # 16-bit audio = 2 bytes per sample
+    num_samples = int(rate * duration_sec)
+    silence = b'\x00\x00' * num_samples
+    return silence + pcm
+
 def pcm16_to_wav_bytes(pcm: bytes, rate: int = 24000) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
@@ -216,7 +223,11 @@ def gemini_tts(text: str, voice: str):
         )
         data = resp.candidates[0].content.parts[0].inline_data.data
         pcm = base64.b64decode(data) if isinstance(data, str) else data
-        return pcm16_to_wav_bytes(pcm), None
+        
+        # 核心修复：添加 0.5 秒静音
+        padded_pcm = add_silence_padding(pcm, duration_sec=0.5)
+        
+        return pcm16_to_wav_bytes(padded_pcm), None
     except Exception as e:
         return None, str(e)
 
@@ -249,11 +260,9 @@ def openai_translate(text: str) -> str:
 # Main UI
 # ============================================================
 def main():
-    # Session State
     if "playing_idx" not in st.session_state: st.session_state.playing_idx = None
     if "audio_data" not in st.session_state: st.session_state.audio_data = None
     if "auto_next_trigger" not in st.session_state: st.session_state.auto_next_trigger = False
-    # 增加一个 unique_id 用于强制刷新 audio 标签
     if "audio_uid" not in st.session_state: st.session_state.audio_uid = str(uuid.uuid4())
 
     with st.sidebar:
@@ -275,23 +284,18 @@ def main():
             trans_engine = st.selectbox("翻译引擎", ["Gemini", "OpenAI"])
         theme = st.radio("主题", ["Light", "Dark"], index=1, horizontal=True)
         
-        # 隐藏的触发按钮（放在侧边栏最底部）
         def trigger_next():
             st.session_state.auto_next_trigger = True
-            # 关键：清除旧音频，防止 Rerun 时显示旧的播放器
             st.session_state.audio_data = None
         
         st.markdown("---")
-        # 这个按钮是 JS 点击的目标
         st.button("NEXT_TRIGGER", key="hidden_next_btn", on_click=trigger_next, type="secondary")
-        # 视觉隐藏
         st.markdown("<style>div.stButton > button:contains('NEXT_TRIGGER') { display: none; }</style>", unsafe_allow_html=True)
 
     if not uploaded:
         st.info("👈 请在左侧上传 EPUB 文件。")
         st.stop()
         
-    # 解析文件
     epub_bytes = uploaded.getvalue()
     book_hash = hashlib.sha256(epub_bytes).hexdigest()
     
@@ -308,7 +312,6 @@ def main():
             
     book = st.session_state.book
     
-    # 章节导航
     c1, c2, c3 = st.columns([1, 4, 1])
     with c1:
         if st.button("⬅️ 上一章", use_container_width=True):
@@ -321,7 +324,6 @@ def main():
             st.session_state.playing_idx = None
             st.rerun()
             
-    # 内容处理
     raw_blocks = extract_chapter_content(epub_bytes, book, st.session_state.chapter_idx)
     chunks = merge_blocks_into_chunks(raw_blocks, max_chars=chunk_size)
     
@@ -329,50 +331,40 @@ def main():
         st.warning("本章内容为空。")
         st.stop()
 
-    # ============================================================
-    # 逻辑核心：处理自动连播触发 & 音频生成
-    # ============================================================
-    
-    # 1. 如果是由 JS 触发了自动下一段
+    # 处理连播
     if st.session_state.auto_next_trigger:
         next_idx = st.session_state.playing_idx + 1 if st.session_state.playing_idx is not None else 0
         if next_idx < len(chunks):
             st.session_state.playing_idx = next_idx
-            st.session_state.audio_data = None # 确保为空，强制进入生成逻辑
-            st.session_state.auto_next_trigger = False # 重置触发器
+            st.session_state.audio_data = None
+            st.session_state.auto_next_trigger = False
         else:
             st.toast("本章播放结束")
             st.session_state.auto_next_trigger = False
 
-    # 2. 生成音频 (如果需要)
-    # 只有当 playing_idx 有值，但 audio_data 为空时，才生成
+    # 生成音频
     if st.session_state.playing_idx is not None and st.session_state.audio_data is None:
         idx = st.session_state.playing_idx
         text = chunks[idx]["text"]
-        
-        # 在顶部显示明显的加载状态
         with st.spinner(f"正在生成第 {idx+1}/{len(chunks)} 段音频 (Gemini)..."):
             wav, err = gemini_tts(text, voice)
-            
         if err:
             st.error(f"生成失败: {err}")
             st.session_state.playing_idx = None
         else:
             st.session_state.audio_data = wav
-            # 关键修复：生成一个新的随机 ID，强迫浏览器认为这是个新音频，解决循环播放旧音频的问题
             st.session_state.audio_uid = str(uuid.uuid4())
-            st.rerun() # 刷新页面显示播放器
+            st.rerun()
 
     # ============================================================
-    # 播放器组件 (置顶 Fixed)
+    # 播放器组件 (强制吸顶 fix)
     # ============================================================
     if st.session_state.audio_data and st.session_state.playing_idx is not None:
         b64 = base64.b64encode(st.session_state.audio_data).decode()
         idx = st.session_state.playing_idx
-        # 自动连播 JS
+        
         on_end_js = ""
         if auto_play and idx + 1 < len(chunks):
-            # 寻找 innerText 为 NEXT_TRIGGER 的按钮并点击
             on_end_js = """
             aud.onended = function() {
                 const btns = window.parent.document.querySelectorAll('button');
@@ -385,16 +377,11 @@ def main():
             };
             """
         
-        # 顶部固定播放栏 HTML
-        # 使用 audio_uid 作为 ID 的一部分，解决缓存问题
+        # 使用 JavaScript window.frameElement 越狱大法
+        # 将 iframe 强制设为 fixed top
         player_html = f"""
-        <div style="
-            position: fixed; top: 0; left: 0; right: 0; 
-            background: #1e1e1e; border-bottom: 1px solid #444; 
-            padding: 10px 20px; z-index: 999999; 
-            display: flex; align-items: center; justify-content: center; gap: 20px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.5);
-        ">
+        <div style="display:flex; align-items:center; justify-content:center; gap:20px; 
+                    background: #1e1e1e; border-bottom: 1px solid #444; width:100%; height:100%; box-sizing:border-box; padding: 0 20px;">
             <span style="color: #fff; font-weight: bold; white-space: nowrap;">
                 🎧 {idx+1} / {len(chunks)}
             </span>
@@ -406,6 +393,21 @@ def main():
             </div>
         </div>
         <script>
+            // 越狱：获取当前 iframe 并强制修改其样式为 Fixed Top
+            try {{
+                const frame = window.frameElement;
+                if (frame) {{
+                    frame.style.position = 'fixed';
+                    frame.style.top = '0px';
+                    frame.style.left = '0px';
+                    frame.style.width = '100vw';
+                    frame.style.height = '60px'; // 播放条高度
+                    frame.style.zIndex = '999999';
+                }}
+            }} catch (e) {{
+                console.log("Sticky player error:", e);
+            }}
+
             var aud = document.getElementById("audio_{st.session_state.audio_uid}");
             if(aud) {{
                 aud.playbackRate = {speed};
@@ -413,18 +415,13 @@ def main():
             }}
         </script>
         """
-        # 这里的 height=60 是给 iframe 预留的高度，确保它能显示出来
-        # 因为 CSS 设置了 fixed top，所以它会脱离文档流浮在上面
         components.html(player_html, height=60)
-        # 为了不让内容被遮挡，加一个垫片
-        st.markdown('<div style="height: 60px;"></div>', unsafe_allow_html=True)
+        
+        # 增加一个垫片，防止内容被吸顶的播放器遮挡
+        st.markdown('<div style="height: 80px;"></div>', unsafe_allow_html=True)
 
 
-    # ============================================================
-    # 内容渲染 (阅读模式 vs 翻译模式)
-    # ============================================================
-    
-    # 样式优化
+    # 内容渲染
     st.markdown("""
     <style>
     .chunk-box { padding: 12px; border-radius: 8px; margin-bottom: 12px; line-height: 1.6; }
@@ -433,17 +430,15 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
-    # 渲染循环
     for i, chunk in enumerate(chunks):
         is_playing = (i == st.session_state.playing_idx)
         
-        # 1. 阅读模式 (左按钮 右文本)
         if view_mode == "阅读模式":
             col_btn, col_txt = st.columns([1, 10])
             with col_btn:
                 btn_type = "primary" if is_playing else "secondary"
                 label = "🔊" if is_playing else f"{i+1}"
-                if st.button(label, key=f"play_{i}", type=btn_type, help="点击朗读"):
+                if st.button(label, key=f"play_{i}", type=btn_type):
                     st.session_state.playing_idx = i
                     st.session_state.audio_data = None
                     st.rerun()
@@ -452,11 +447,8 @@ def main():
                 border = "2px solid #ffbd45" if is_playing else "1px solid transparent"
                 st.markdown(f'<div class="chunk-box" style="background:{bg}; border:{border}">{chunk["html"]}</div>', unsafe_allow_html=True)
 
-        # 2. 对照翻译模式 (左原文+播放，右译文)
         else:
             col_left, col_right = st.columns(2)
-            
-            # 左栏：原文 + 播放按钮
             with col_left:
                 c_btn, c_txt = st.columns([1.5, 8.5])
                 with c_btn:
@@ -470,9 +462,7 @@ def main():
                     border = "2px solid #ffbd45" if is_playing else "1px solid #444"
                     st.markdown(f'<div class="chunk-box" style="background:{bg}; border:{border}">{chunk["html"]}</div>', unsafe_allow_html=True)
             
-            # 右栏：翻译
             with col_right:
-                # 检查是否有缓存的翻译
                 cache_key = f"trans_{st.session_state.book_hash}_{st.session_state.chapter_idx}_{i}"
                 if cache_key in st.session_state:
                     st.markdown(f'<div class="trans-box">{st.session_state[cache_key]}</div>', unsafe_allow_html=True)
