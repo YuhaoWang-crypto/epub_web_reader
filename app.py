@@ -1330,7 +1330,8 @@ if view_mode == "排版（HTML）" and tts_mode.startswith("Gemini"):
                             autoplay=True,
                             next_seg_after_batch=next_seg_after_batch,
                             batch_label=label
-                        )                except Exception as e:
+                        )                
+                        except Exception as e:
                     st.error(f"Gemini TTS 失败：{e}")
                     st.caption("若出现 429 RESOURCE_EXHAUSTED：说明配额/速率耗尽，需要稍后重试或启用计费。")
 
