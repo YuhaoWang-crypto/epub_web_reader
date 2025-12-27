@@ -1027,7 +1027,6 @@ with nav_cols[1]:
     st.session_state.g_seg_idx = 0
     st.session_state.g_autoplay = False
     st.session_state.g_audio_cache = {}  # {seg_idx: wav_bytes}
-        st.rerun()
 with nav_cols[2]:
     st.markdown(f"### {labels[st.session_state.chapter_idx]}")
 
