@@ -579,6 +579,37 @@ def wrap_reader_html(body_html: str, font_size: int, line_height: float, max_wid
         </div>
         """
 
+
+    # Client-side highlight sync (used by Gemini batch player)
+    highlight_script = """
+    <script>
+      (function() {
+        function setCurrent(blockIdx) {
+          try {
+            const links = document.querySelectorAll('a.tts-link');
+            links.forEach(l => l.classList.remove('tts-current'));
+            const target = document.querySelector('a.tts-link[data-tts-idx="' + blockIdx + '"]');
+            if (target) {
+              target.classList.add('tts-current');
+              try {
+                target.scrollIntoView({block: 'center', behavior: 'smooth'});
+              } catch(e) {}
+            }
+          } catch(e) {}
+        }
+
+        window.addEventListener('message', function(ev) {
+          const d = ev.data;
+          if (!d || d.type !== 'tts_highlight') return;
+          const idx = parseInt(d.idx);
+          if (Number.isNaN(idx)) return;
+          setCurrent(idx);
+        });
+      })();
+    </script>
+    """
+    tts_script = (tts_script or "") + highlight_script
+
     return f"""<!doctype html>
 <html>
 <head>
@@ -693,7 +724,7 @@ def build_gemini_clickable_body(blocks, current_idx: Optional[int]):
         # Ensure badge is inside a wrapper so it appears at the beginning of the block.
         wrapped_html = f'<div class="para-wrap">{badge}{b["html"]}</div>'
 
-        out.append(f'<a class="{cls}" target="_top" href="?tts_start={i}">{wrapped_html}</a>')
+        out.append(f'<a class="{cls}" data-tts-idx="{i}" id="tts_{i}" target="_top" href="?tts_start={i}">{wrapped_html}</a>')
     return "\n".join(out)
 
 
@@ -761,19 +792,29 @@ def wav_bytes_to_data_uri(wav_bytes: bytes) -> str:
     return f"data:audio/wav;base64,{b64}"
 
 
-def render_batch_player(wav_list: List[bytes], meta_list: List[str], autoplay: bool, next_seg_after_batch: Optional[int], batch_label: str):
+def render_batch_player(
+    wav_list: List[bytes],
+    meta_list: Optional[List[str]],
+    highlight_blocks: Optional[List[int]],
+    autoplay: bool,
+    next_seg_after_batch: Optional[int],
+    batch_label: str,
+):
     """
     HTML audio player that plays a batch of segments sequentially.
-    - wav_list: audio blobs (WAV)
-    - meta_list: same length as wav_list; display labels like "段 3（10-11）"
-    It attempts autoplay; if the browser blocks autoplay, user can click "播放" to start.
-    After the batch ends, it navigates to next batch (?tts_seg=...&autoplay=1) to keep going.
+
+    wav_list: WAV byte blobs (each item is one segment audio)
+    meta_list: display labels for each segment (same length as wav_list)
+    highlight_blocks: block indices (same length as wav_list). Used to highlight the reading pane.
     """
     if not wav_list:
         return
 
     if not meta_list or len(meta_list) != len(wav_list):
         meta_list = [f"第 {i+1} 段" for i in range(len(wav_list))]
+
+    if not highlight_blocks or len(highlight_blocks) != len(wav_list):
+        highlight_blocks = [0 for _ in range(len(wav_list))]
 
     uris = [wav_bytes_to_data_uri(w) for w in wav_list]
     ap = "true" if autoplay else "false"
@@ -795,6 +836,7 @@ def render_batch_player(wav_list: List[bytes], meta_list: List[str], autoplay: b
       (function() {{
         const playlist = {json.dumps(uris)};
         const meta = {json.dumps(meta_list)};
+        const hi = {json.dumps(highlight_blocks)};
         const hasNext = Boolean("{nxt}");
         const nextSeg = "{nxt}";
         const a = document.getElementById("ab");
@@ -802,9 +844,23 @@ def render_batch_player(wav_list: List[bytes], meta_list: List[str], autoplay: b
         const info = document.getElementById("abInfo");
         let idx = 0;
 
+        function broadcastHighlight(blockIdx) {{
+          const msg = {{type: "tts_highlight", idx: blockIdx}};
+          try {{
+            const topWin = window.top;
+            // broadcast to all frames
+            for (let i = 0; i < topWin.frames.length; i++) {{
+              try {{ topWin.frames[i].postMessage(msg, "*"); }} catch (e) {{}}
+            }}
+            try {{ topWin.postMessage(msg, "*"); }} catch (e) {{}}
+          }} catch (e) {{
+            try {{ window.parent.postMessage(msg, "*"); }} catch (e2) {{}}
+          }}
+        }}
+
         function setInfo() {{
           const m = meta[idx] || "";
-          info.textContent = `正在播放：${m}    （队列 ${idx+1} / ${playlist.length}）`;
+          info.textContent = "正在播放：" + m + "    （队列 " + (idx+1) + " / " + playlist.length + "）";
         }}
 
         function gotoNextBatch() {{
@@ -830,13 +886,13 @@ def render_batch_player(wav_list: List[bytes], meta_list: List[str], autoplay: b
           a.src = playlist[idx];
           a.load();
           setInfo();
+          broadcastHighlight(hi[idx]);
           a.play().catch(() => {{
-            // Autoplay blocked; user must click play
+            // Autoplay blocked; user can click play
           }});
         }}
 
         btn.addEventListener("click", () => {{
-          // If user clicks, start/resume playing current index
           if (!a.src) {{
             playIndex(idx);
           }} else {{
@@ -855,11 +911,14 @@ def render_batch_player(wav_list: List[bytes], meta_list: List[str], autoplay: b
         }} else {{
           a.src = playlist[0];
           a.load();
+          broadcastHighlight(hi[0]);
         }}
       }})();
     </script>
     """
     components.html(html, height=190, scrolling=False)
+
+
 
 
 # ============================================================
@@ -1365,6 +1424,7 @@ if view_mode == "排版（HTML）" and tts_mode.startswith("Gemini"):
                     batch_size = 3
                     wav_list = []
                     meta_list = []
+                    hi_list = []
                     last_seg_in_batch = cur
 
                     # generate current and next segments up to batch_size
@@ -1377,6 +1437,7 @@ if view_mode == "排版（HTML）" and tts_mode.startswith("Gemini"):
                         wav_list.append(st.session_state.g_audio_cache.get(si))
                         seg = segments[si]
                         meta_list.append(f"段 {si+1}（{seg['start_block']+1}-{seg['end_block']}）")
+                        hi_list.append(seg['start_block'])
                         last_seg_in_batch = si
 
                     # After batch, continue from this seg
@@ -1387,13 +1448,16 @@ if view_mode == "排版（HTML）" and tts_mode.startswith("Gemini"):
                         label = f"连播：段 {cur+1}–{(last_seg_in_batch+1)} / {total}"
                         final_wavs = []
                         final_meta = []
-                        for _w, _m in zip(wav_list, meta_list):
+                        final_hi = []
+                        for _w, _m, _h in zip(wav_list, meta_list, hi_list):
                             if _w:
                                 final_wavs.append(_w)
                                 final_meta.append(_m)
+                                final_hi.append(_h)
                         render_batch_player(
                             wav_list=final_wavs,
                             meta_list=final_meta,
+                            highlight_blocks=final_hi,
                             autoplay=True,
                             next_seg_after_batch=next_seg_after_batch,
                             batch_label=label,
