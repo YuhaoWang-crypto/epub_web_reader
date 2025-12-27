@@ -761,14 +761,19 @@ def wav_bytes_to_data_uri(wav_bytes: bytes) -> str:
     return f"data:audio/wav;base64,{b64}"
 
 
-def render_batch_player(wav_list: List[bytes], autoplay: bool, next_seg_after_batch: Optional[int], batch_label: str):
+def render_batch_player(wav_list: List[bytes], meta_list: List[str], autoplay: bool, next_seg_after_batch: Optional[int], batch_label: str):
     """
     HTML audio player that plays a batch of segments sequentially.
+    - wav_list: audio blobs (WAV)
+    - meta_list: same length as wav_list; display labels like "段 3（10-11）"
     It attempts autoplay; if the browser blocks autoplay, user can click "播放" to start.
-    After the batch ends, it navigates to ?tts_seg=next_seg_after_batch&autoplay=1 to continue.
+    After the batch ends, it navigates to next batch (?tts_seg=...&autoplay=1) to keep going.
     """
     if not wav_list:
         return
+
+    if not meta_list or len(meta_list) != len(wav_list):
+        meta_list = [f"第 {i+1} 段" for i in range(len(wav_list))]
 
     uris = [wav_bytes_to_data_uri(w) for w in wav_list]
     ap = "true" if autoplay else "false"
@@ -781,7 +786,7 @@ def render_batch_player(wav_list: List[bytes], autoplay: bool, next_seg_after_ba
         <button id="abPlay" style="padding:8px 14px; border-radius:10px; border:1px solid rgba(127,127,127,.35); background:rgba(127,127,127,.08); color:inherit; cursor:pointer;">
           播放
         </button>
-        <span id="abInfo" style="opacity:.8; font-size:13px;"></span>
+        <span id="abInfo" style="opacity:.9; font-size:13px;"></span>
       </div>
       <audio id="ab" controls style="width:100%"></audio>
     </div>
@@ -789,6 +794,7 @@ def render_batch_player(wav_list: List[bytes], autoplay: bool, next_seg_after_ba
     <script>
       (function() {{
         const playlist = {json.dumps(uris)};
+        const meta = {json.dumps(meta_list)};
         const hasNext = Boolean("{nxt}");
         const nextSeg = "{nxt}";
         const a = document.getElementById("ab");
@@ -797,15 +803,28 @@ def render_batch_player(wav_list: List[bytes], autoplay: bool, next_seg_after_ba
         let idx = 0;
 
         function setInfo() {{
-          info.textContent = `播放队列：${{idx+1}} / ${{playlist.length}}`;
+          const m = meta[idx] || "";
+          info.textContent = `正在播放：${m}    （队列 ${idx+1} / ${playlist.length}）`;
+        }}
+
+        function gotoNextBatch() {{
+          if (!hasNext) return;
+          setTimeout(() => {{
+            try {{
+              const url = new URL(window.top.location.href);
+              url.searchParams.set("tts_seg", nextSeg);
+              url.searchParams.set("autoplay", "1");
+              window.top.location.href = url.toString();
+            }} catch (e) {{
+              window.top.location.search = "?tts_seg=" + nextSeg + "&autoplay=1";
+            }}
+          }}, 250);
         }}
 
         function playIndex(i) {{
           idx = i;
           if (idx >= playlist.length) {{
-            if (hasNext) {{
-              window.top.location.search = "?tts_seg=" + nextSeg + "&autoplay=1";
-            }}
+            gotoNextBatch();
             return;
           }}
           a.src = playlist[idx];
@@ -834,7 +853,6 @@ def render_batch_player(wav_list: List[bytes], autoplay: bool, next_seg_after_ba
         if ({ap}) {{
           playIndex(0);
         }} else {{
-          // preload first src, but don't autoplay
           a.src = playlist[0];
           a.load();
         }}
@@ -994,6 +1012,7 @@ if "book_hash" not in st.session_state or st.session_state.book_hash != book_has
     st.session_state.g_seg_idx = 0
     st.session_state.g_autoplay = False
     st.session_state.g_audio_cache = {}  # {seg_idx: wav_bytes}
+    st.session_state._g_from_par_click = False
 
 qp = get_query_params()
 
@@ -1003,6 +1022,7 @@ if "tts_start" in qp:
         raw = qp["tts_start"][0] if isinstance(qp["tts_start"], list) else qp["tts_start"]
         idx = int(raw)
         st.session_state.g_tts_pos = max(0, idx)
+        st.session_state._g_from_par_click = True
     except Exception:
         pass
 
@@ -1059,6 +1079,7 @@ if selected != st.session_state.chapter_idx:
     st.session_state.g_seg_idx = 0
     st.session_state.g_autoplay = False
     st.session_state.g_audio_cache = {}  # {seg_idx: wav_bytes}
+    st.session_state._g_from_par_click = False
 
 nav_cols = st.columns([1, 1, 6])
 with nav_cols[0]:
@@ -1069,6 +1090,7 @@ with nav_cols[0]:
     st.session_state.g_seg_idx = 0
     st.session_state.g_autoplay = False
     st.session_state.g_audio_cache = {}  # {seg_idx: wav_bytes}
+    st.session_state._g_from_par_click = False
 with nav_cols[1]:
     if st.button("下一章", disabled=(st.session_state.chapter_idx >= chapter_count - 1), use_container_width=True):
         st.session_state.chapter_idx += 1
@@ -1077,6 +1099,7 @@ with nav_cols[1]:
     st.session_state.g_seg_idx = 0
     st.session_state.g_autoplay = False
     st.session_state.g_audio_cache = {}  # {seg_idx: wav_bytes}
+    st.session_state._g_from_par_click = False
 with nav_cols[2]:
     st.markdown(f"### {labels[st.session_state.chapter_idx]}")
 
@@ -1276,12 +1299,18 @@ if view_mode == "排版（HTML）" and tts_mode.startswith("Gemini"):
             segments = build_segments_from_blocks(blocks, max_chars=int(max_chars))
             b2s = build_block_to_segment_map(blocks, segments)
 
-            # Synchronize segment cursor with block cursor (from click)
+            # Synchronize cursors
             st.session_state.g_seg_idx = max(0, min(len(segments) - 1, int(st.session_state.get("g_seg_idx", 0))))
             st.session_state.g_tts_pos = max(0, min(len(blocks) - 1, int(st.session_state.get("g_tts_pos", 0))))
-            st.session_state.g_seg_idx = b2s[st.session_state.g_tts_pos]
-            # If navigation set a new segment cursor, align block cursor to segment start for highlighting
-            st.session_state.g_tts_pos = segments[st.session_state.g_seg_idx]['start_block']
+
+            # Only recompute segment cursor from paragraph cursor when user clicked a paragraph.
+            if bool(st.session_state.get("_g_from_par_click", False)):
+                st.session_state.g_seg_idx = b2s[st.session_state.g_tts_pos]
+                st.session_state._g_from_par_click = False
+
+            # Always align paragraph cursor to the segment start for highlighting.
+            st.session_state.g_tts_pos = segments[st.session_state.g_seg_idx]["start_block"]
+
 
             # Cache dict
             if "g_audio_cache" not in st.session_state or not isinstance(st.session_state.g_audio_cache, dict):
@@ -1335,6 +1364,7 @@ if view_mode == "排版（HTML）" and tts_mode.startswith("Gemini"):
                     # current + batch prefetch (default 3 segments)
                     batch_size = 3
                     wav_list = []
+                    meta_list = []
                     last_seg_in_batch = cur
 
                     # generate current and next segments up to batch_size
@@ -1345,6 +1375,8 @@ if view_mode == "排版（HTML）" and tts_mode.startswith("Gemini"):
                                     segments[si]["text"], voice_name=voice, model=model, style=style
                                 )
                         wav_list.append(st.session_state.g_audio_cache.get(si))
+                        seg = segments[si]
+                        meta_list.append(f"段 {si+1}（{seg['start_block']+1}-{seg['end_block']}）")
                         last_seg_in_batch = si
 
                     # After batch, continue from this seg
@@ -1353,11 +1385,18 @@ if view_mode == "排版（HTML）" and tts_mode.startswith("Gemini"):
                     cur_wav = wav_list[0] if wav_list else None
                     if cur_wav:
                         label = f"连播：段 {cur+1}–{(last_seg_in_batch+1)} / {total}"
+                        final_wavs = []
+                        final_meta = []
+                        for _w, _m in zip(wav_list, meta_list):
+                            if _w:
+                                final_wavs.append(_w)
+                                final_meta.append(_m)
                         render_batch_player(
-                            wav_list=[w for w in wav_list if w],
+                            wav_list=final_wavs,
+                            meta_list=final_meta,
                             autoplay=True,
                             next_seg_after_batch=next_seg_after_batch,
-                            batch_label=label
+                            batch_label=label,
                         )
                 except Exception as e:
                     st.error(f"Gemini TTS 失败：{e}")
