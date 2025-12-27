@@ -15,6 +15,7 @@ import xml.etree.ElementTree as ET
 import streamlit as st
 import streamlit.components.v1 as components
 from bs4 import BeautifulSoup
+from typing import Optional, List, Dict
 
 # ============================================================
 # Optional dependencies
@@ -676,7 +677,7 @@ def wrap_reader_html(body_html: str, font_size: int, line_height: float, max_wid
 </html>"""
 
 
-def build_gemini_clickable_body(blocks, current_idx: int | None):
+def build_gemini_clickable_body(blocks, current_idx: Optional[int]):
     """
     Wrap each block in a top-level link so clicking it sets start position (?tts_start=i).
     Also prefix each block with a small paragraph number badge for orientation.
@@ -760,7 +761,7 @@ def wav_bytes_to_data_uri(wav_bytes: bytes) -> str:
     return f"data:audio/wav;base64,{b64}"
 
 
-def render_batch_player(wav_list: list[bytes], autoplay: bool, next_seg_after_batch: int | None, batch_label: str):
+def render_batch_player(wav_list: List[bytes], autoplay: bool, next_seg_after_batch: Optional[int], batch_label: str):
     """
     HTML audio player that plays a batch of segments sequentially without reloading.
     After the batch ends, it navigates to ?tts_seg=next_seg_after_batch&autoplay=1 to continue with next batch.
@@ -797,7 +798,7 @@ def render_batch_player(wav_list: list[bytes], autoplay: bool, next_seg_after_ba
             }}
             return;
           }}
-          a.src = playlist[idx];
+          a.src = playList[idx];
           a.load();
           if ({ap}) {{
             a.play().catch(()=>{{}});
@@ -1196,11 +1197,11 @@ else:
                 # show only first 60 segments to avoid huge UI; for long books you can adjust max_chars to reduce count
                 max_show = min(80, len(_segs_for_list))
                 for si in range(max_show):
-                    seg = _segs_for_list[si]
+                    seg = _segs_for_List[si]
                     label = f"{si+1}  ({seg['start_block']+1}-{max(seg['end_block'], seg['start_block']+1)})"
                     if st.button(label, key=f"seg_btn_{si}", use_container_width=True):
                         st.session_state.g_seg_idx = si
-                        st.session_state.g_tts_pos = _segs_for_list[si]["start_block"]
+                        st.session_state.g_tts_pos = _segs_for_List[si]["start_block"]
                         st.session_state.g_autoplay = True
                         st.rerun()
                 if len(_segs_for_list) > max_show:
@@ -1322,7 +1323,7 @@ if view_mode == "排版（HTML）" and tts_mode.startswith("Gemini"):
                     # After batch, continue from this seg
                     next_seg_after_batch = (last_seg_in_batch + 1) if (last_seg_in_batch + 1 < total) else None
 
-                    cur_wav = wav_list[0] if wav_list else None
+                    cur_wav = wav_List[0] if wav_list else None
                     if cur_wav:
                         label = f"连播：段 {cur+1}–{(last_seg_in_batch+1)} / {total}"
                         render_batch_player(
