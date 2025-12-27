@@ -677,13 +677,24 @@ def wrap_reader_html(body_html: str, font_size: int, line_height: float, max_wid
 
 
 def build_gemini_clickable_body(blocks, current_idx: int | None):
+    """
+    Wrap each block in a top-level link so clicking it sets start position (?tts_start=i).
+    Also prefix each block with a small paragraph number badge for orientation.
+    """
     out = []
     for i, b in enumerate(blocks):
         cls = "tts-link"
         if current_idx is not None and i == current_idx:
             cls += " tts-current"
-        out.append(f'<a class="{cls}" target="_top" href="?tts_start={i}">{b["html"]}</a>')
-    return "\n".join(out)
+
+        # Add a numbered badge before the block HTML.
+        badge = f'<span class="para-badge">{i+1}</span>'
+        # Ensure badge is inside a wrapper so it appears at the beginning of the block.
+        wrapped_html = f'<div class="para-wrap">{badge}{b["html"]}</div>'
+
+        out.append(f'<a class="{cls}" target="_top" href="?tts_start={i}">{wrapped_html}</a>')
+    return "
+".join(out)
 
 
 
@@ -1175,7 +1186,8 @@ else:
                 # show only first 60 segments to avoid huge UI; for long books you can adjust max_chars to reduce count
                 max_show = min(80, len(_segs_for_list))
                 for si in range(max_show):
-                    label = f"{si+1}"
+                    seg = _segs_for_list[si]
+                    label = f"{si+1}  ({seg['start_block']+1}-{max(seg['end_block'], seg['start_block']+1)})"
                     if st.button(label, key=f"seg_btn_{si}", use_container_width=True):
                         st.session_state.g_seg_idx = si
                         st.session_state.g_tts_pos = _segs_for_list[si]["start_block"]
@@ -1442,9 +1454,22 @@ with st.expander("在线朗读（Google Gemini TTS：Kore 等，播放 WAV，不
         if not blocks:
             st.warning("本章无可朗读段落。")
         else:
-            start_idx = st.number_input("从第几段开始", min_value=1, max_value=len(blocks), value=1, step=1, key="gemini_debug_start")
-            count = st.number_input("朗读多少段", min_value=1, max_value=min(40, len(blocks)), value=min(8, len(blocks)), step=1, key="gemini_debug_count")
-            tts_text = "\n\n".join(b["text"] for b in blocks[int(start_idx) - 1: int(start_idx) - 1 + int(count)])
+            total_blocks = len(blocks)
+            st.caption(f"本章段落总数：{total_blocks}。你可以指定起止段落生成音频。")
+
+            start_idx = st.number_input("从第几段开始", min_value=1, max_value=total_blocks, value=1, step=1, key="gemini_debug_start")
+            end_idx = st.number_input("到第几段结束（含）", min_value=1, max_value=total_blocks, value=min(14, total_blocks), step=1, key="gemini_debug_end")
+
+            s = int(start_idx)
+            e = int(end_idx)
+            if e < s:
+                s, e = e, s
+            s0 = max(1, min(s, total_blocks))
+            e0 = max(1, min(e, total_blocks))
+
+            st.info(f"将朗读：第 {s0} 段 到 第 {e0} 段（共 {e0 - s0 + 1} 段）。")
+
+            tts_text = "\n\n".join(b["text"] for b in blocks[s0 - 1: e0])
 
             if st.button("生成并播放（Gemini TTS）", use_container_width=True, key="gemini_debug_play"):
                 try:
