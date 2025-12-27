@@ -1019,7 +1019,6 @@ with nav_cols[0]:
     st.session_state.g_seg_idx = 0
     st.session_state.g_autoplay = False
     st.session_state.g_audio_cache = {}  # {seg_idx: wav_bytes}
-        st.rerun()
 with nav_cols[1]:
     if st.button("下一章", disabled=(st.session_state.chapter_idx >= chapter_count - 1), use_container_width=True):
         st.session_state.chapter_idx += 1
