@@ -923,6 +923,7 @@ with st.sidebar:
     st.divider()
     st.subheader("在线朗读（主阅读声音）")
     tts_mode = st.radio("朗读引擎", ["Gemini（Kore等）", "浏览器（系统语音）"], horizontal=False, index=0)
+    show_seg_list = st.checkbox("显示段落列表（便于点击跳转/播放）", value=True)
     st.caption("Gemini：点击段落可设起点；停止后可从上次位置继续（不会遗忘）。")
 
     st.divider()
@@ -1158,7 +1159,36 @@ else:
             speech_lang=speech_lang,
         )
 
-    components.html(full_html, height=900, scrolling=True)
+    if tts_mode.startswith("Gemini") and bool(locals().get("show_seg_list", True)):
+        # Build segments list for quick navigation
+        try:
+            _blocks_for_list = extract_chapter_blocks(epub_bytes, book, st.session_state.chapter_idx)
+            _segs_for_list = build_segments_from_blocks(_blocks_for_list, max_chars=int(st.session_state.get("seg_max_chars", 1200)))
+        except Exception:
+            _blocks_for_list, _segs_for_list = [], []
+
+        left_col, right_col = st.columns([1, 4], gap="large")
+        with left_col:
+            st.markdown("#### 段落")
+            st.caption("点击编号：设为起点并自动播放")
+            if _segs_for_list:
+                # show only first 60 segments to avoid huge UI; for long books you can adjust max_chars to reduce count
+                max_show = min(80, len(_segs_for_list))
+                for si in range(max_show):
+                    label = f"{si+1}"
+                    if st.button(label, key=f"seg_btn_{si}", use_container_width=True):
+                        st.session_state.g_seg_idx = si
+                        st.session_state.g_tts_pos = _segs_for_list[si]["start_block"]
+                        st.session_state.g_autoplay = True
+                        st.rerun()
+                if len(_segs_for_list) > max_show:
+                    st.caption(f"已显示前 {max_show} 段（共 {len(_segs_for_list)} 段）。可通过增大“每段最大字符”来减少段数。")
+            else:
+                st.info("未能生成段落列表。")
+        with right_col:
+            components.html(full_html, height=900, scrolling=True)
+    else:
+        components.html(full_html, height=900, scrolling=True)
 
 # ============================================================
 # Gemini main reading controls (stateful position)
@@ -1187,6 +1217,7 @@ if view_mode == "排版（HTML）" and tts_mode.startswith("Gemini"):
             style = st.text_input("风格（可选）", value="请用温柔、自然、略慢的语气朗读：")
         with colD:
             max_chars = st.number_input("每段最大字符（≈token）", min_value=400, max_value=2600, value=1200, step=100)
+        st.session_state.seg_max_chars = int(max_chars)
 
         blocks = extract_chapter_blocks(epub_bytes, book, st.session_state.chapter_idx)
         if not blocks:
@@ -1277,6 +1308,65 @@ if view_mode == "排版（HTML）" and tts_mode.startswith("Gemini"):
                 except Exception as e:
                     st.error(f"Gemini TTS 失败：{e}")
                     st.caption("若出现 429 RESOURCE_EXHAUSTED：说明配额/速率耗尽，需要稍后重试或启用计费。")
+
+
+
+# ============================================================
+# Edge TTS helpers (MP3)  - required for "生成本章 MP3" block
+# ============================================================
+def _chunk_text(text: str, max_chars: int = 3000):
+    paras = [p.strip() for p in re.split(r"\n{2,}|\r\n{2,}", text) if p.strip()]
+    chunks, buf = [], ""
+    for p in paras:
+        if not buf:
+            buf = p
+        elif len(buf) + 2 + len(p) <= max_chars:
+            buf += "\n\n" + p
+        else:
+            chunks.append(buf)
+            buf = p
+    if buf:
+        chunks.append(buf)
+
+    out = []
+    for c in chunks:
+        if len(c) <= max_chars:
+            out.append(c)
+        else:
+            for i in range(0, len(c), max_chars):
+                out.append(c[i:i + max_chars])
+    return out
+
+
+def _strip_id3_if_present(mp3_bytes: bytes) -> bytes:
+    if len(mp3_bytes) < 10:
+        return mp3_bytes
+    if mp3_bytes[:3] != b"ID3":
+        return mp3_bytes
+    size_bytes = mp3_bytes[6:10]
+    size = ((size_bytes[0] & 0x7F) << 21) | ((size_bytes[1] & 0x7F) << 14) | ((size_bytes[2] & 0x7F) << 7) | (size_bytes[3] & 0x7F)
+    start = 10 + size
+    return mp3_bytes[start:] if start < len(mp3_bytes) else mp3_bytes
+
+
+async def edge_tts_mp3_from_text(text: str, voice: str, rate: str, pitch: str, volume: str) -> bytes:
+    audio = bytearray()
+    communicate = edge_tts.Communicate(text, voice=voice, rate=rate, pitch=pitch, volume=volume)
+    async for chunk in communicate.stream():
+        if chunk.get("type") == "audio":
+            audio.extend(chunk["data"])
+    return bytes(audio)
+
+
+async def edge_tts_mp3_long(text: str, voice: str, rate: str, pitch: str, volume: str, max_chars: int = 3000) -> bytes:
+    parts = _chunk_text(text, max_chars=max_chars)
+    out = bytearray()
+    for i, part in enumerate(parts):
+        mp3_part = await edge_tts_mp3_from_text(part, voice, rate, pitch, volume)
+        if i > 0:
+            mp3_part = _strip_id3_if_present(mp3_part)
+        out.extend(mp3_part)
+    return bytes(out)
 
 
 # ============================================================
