@@ -760,49 +760,60 @@ def wav_bytes_to_data_uri(wav_bytes: bytes) -> str:
     return f"data:audio/wav;base64,{b64}"
 
 
-def render_two_stage_player(cur_wav: bytes, next_wav: bytes | None, autoplay: bool, next_seg: int | None):
+def render_batch_player(wav_list: list[bytes], autoplay: bool, next_seg_after_batch: int | None, batch_label: str):
     """
-    HTML audio player that can auto-continue to next segment.
-    If next_wav is provided, it preloads next and plays it after current ends.
-    After current ends, it can also navigate to ?tts_seg=next_seg&autoplay=1 to persist position.
+    HTML audio player that plays a batch of segments sequentially without reloading.
+    After the batch ends, it navigates to ?tts_seg=next_seg_after_batch&autoplay=1 to continue with next batch.
+    Cursor will therefore advance at least once per batch (e.g., every 3 segments).
     """
-    cur_uri = wav_bytes_to_data_uri(cur_wav) if cur_wav else ""
-    next_uri = wav_bytes_to_data_uri(next_wav) if next_wav else ""
+    if not wav_list:
+        return
+
+    uris = [wav_bytes_to_data_uri(w) for w in wav_list]
     ap = "true" if autoplay else "false"
-    nxt = str(next_seg) if next_seg is not None else ""
+    nxt = "" if next_seg_after_batch is None else str(next_seg_after_batch)
 
     html = f"""
     <div style="padding:8px 0;">
-      <audio id="a1" src="{cur_uri}" {"autoplay" if autoplay else ""} controls style="width:100%"></audio>
-      <audio id="a2" src="{next_uri}" preload="auto" style="display:none"></audio>
+      <div style="font-size:14px; opacity:.85; margin-bottom:6px;">{batch_label}</div>
+      <audio id="ab" controls style="width:100%"></audio>
     </div>
+
     <script>
       (function() {{
-        const a1 = document.getElementById("a1");
-        const a2 = document.getElementById("a2");
-        const hasNext = Boolean("{next_uri}") && Boolean("{nxt}");
+        const playlist = {json.dumps(uris)};
+        const hasNext = Boolean("{nxt}");
+        const nextSeg = "{nxt}";
+        const a = document.getElementById("ab");
+        let idx = 0;
 
-        // If autoplay requested, try play (some browsers require user gesture; Streamlit usually ok after button click)
-        if ({ap}) {{
-          a1.play().catch(()=>{{}});
+        function playIndex(i) {{
+          idx = i;
+          if (idx >= playlist.length) {{
+            // batch finished
+            if (hasNext) {{
+              // navigate to next batch; autoplay will be attempted on reload
+              window.top.location.search = "?tts_seg=" + nextSeg + "&autoplay=1";
+            }}
+            return;
+          }}
+          a.src = playlist[idx];
+          a.load();
+          if ({ap}) {{
+            a.play().catch(()=>{{}});
+          }}
         }}
 
-        a1.addEventListener("ended", () => {{
-          if (hasNext) {{
-            // Play next locally for continuity
-            a2.style.display = "block";
-            a2.play().catch(()=>{{}});
-            // Persist position by navigating (fast, because next is pre-generated in cache)
-            // This will refresh the Streamlit app and set cursor to next segment.
-            setTimeout(() => {{
-              window.top.location.search = "?tts_seg={nxt}&autoplay=1";
-            }}, 200);
-          }}
+        a.addEventListener("ended", () => {{
+          playIndex(idx + 1);
         }});
+
+        // start
+        playIndex(0);
       }})();
     </script>
     """
-    components.html(html, height=110, scrolling=False)
+    components.html(html, height=150, scrolling=False)
 
 
 # ============================================================
@@ -1241,6 +1252,8 @@ if view_mode == "排版（HTML）" and tts_mode.startswith("Gemini"):
             st.session_state.g_seg_idx = max(0, min(len(segments) - 1, int(st.session_state.get("g_seg_idx", 0))))
             st.session_state.g_tts_pos = max(0, min(len(blocks) - 1, int(st.session_state.get("g_tts_pos", 0))))
             st.session_state.g_seg_idx = b2s[st.session_state.g_tts_pos]
+            # If navigation set a new segment cursor, align block cursor to segment start for highlighting
+            st.session_state.g_tts_pos = segments[st.session_state.g_seg_idx]['start_block']
 
             # Cache dict
             if "g_audio_cache" not in st.session_state or not isinstance(st.session_state.g_audio_cache, dict):
@@ -1291,32 +1304,33 @@ if view_mode == "排版（HTML）" and tts_mode.startswith("Gemini"):
             # Generate audio on demand (and prefetch next)
             if play or autoplay:
                 try:
-                    # current
-                    if cur not in st.session_state.g_audio_cache:
-                        with st.spinner("正在生成当前段音频（WAV）…"):
-                            st.session_state.g_audio_cache[cur] = gemini_tts_wav(
-                                cur_seg["text"], voice_name=voice, model=model, style=style
-                            )
+                    # current + batch prefetch (default 3 segments)
+                    batch_size = 3
+                    wav_list = []
+                    last_seg_in_batch = cur
 
-                    # next prefetch (best-effort)
-                    next_wav = None
-                    if next_seg is not None:
-                        if next_seg not in st.session_state.g_audio_cache:
-                            with st.spinner("预缓存下一段音频…"):
-                                st.session_state.g_audio_cache[next_seg] = gemini_tts_wav(
-                                    segments[next_seg]["text"], voice_name=voice, model=model, style=style
+                    # generate current and next segments up to batch_size
+                    for si in range(cur, min(total, cur + batch_size)):
+                        if si not in st.session_state.g_audio_cache:
+                            with st.spinner(f"正在生成第 {si+1} 段音频（WAV）…"):
+                                st.session_state.g_audio_cache[si] = gemini_tts_wav(
+                                    segments[si]["text"], voice_name=voice, model=model, style=style
                                 )
-                        next_wav = st.session_state.g_audio_cache.get(next_seg)
+                        wav_list.append(st.session_state.g_audio_cache.get(si))
+                        last_seg_in_batch = si
 
-                    cur_wav = st.session_state.g_audio_cache.get(cur)
-                    # Render player that can continue to next and persist position
-                    render_two_stage_player(
-                        cur_wav=cur_wav,
-                        next_wav=next_wav,
-                        autoplay=True,
-                        next_seg=next_seg
-                    )
-                except Exception as e:
+                    # After batch, continue from this seg
+                    next_seg_after_batch = (last_seg_in_batch + 1) if (last_seg_in_batch + 1 < total) else None
+
+                    cur_wav = wav_list[0] if wav_list else None
+                    if cur_wav:
+                        label = f"连播：段 {cur+1}–{(last_seg_in_batch+1)} / {total}"
+                        render_batch_player(
+                            wav_list=[w for w in wav_list if w],
+                            autoplay=True,
+                            next_seg_after_batch=next_seg_after_batch,
+                            batch_label=label
+                        )                except Exception as e:
                     st.error(f"Gemini TTS 失败：{e}")
                     st.caption("若出现 429 RESOURCE_EXHAUSTED：说明配额/速率耗尽，需要稍后重试或启用计费。")
 
