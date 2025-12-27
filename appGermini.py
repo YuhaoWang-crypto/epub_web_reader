@@ -5,9 +5,10 @@ import io
 import re
 import wave
 import zipfile
+import time
+import uuid
 import xml.etree.ElementTree as ET
 import posixpath
-import time
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -142,7 +143,6 @@ def extract_chapter_content(epub_bytes: bytes, book: dict, chapter_idx: int):
     body = soup.body or soup
     for s in body.find_all("script"): s.decompose()
     
-    # 提取所有块级元素
     raw_blocks = []
     for el in body.find_all(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "div"]):
         text = el.get_text(" ", strip=True)
@@ -162,35 +162,27 @@ def extract_chapter_content(epub_bytes: bytes, book: dict, chapter_idx: int):
     return raw_blocks
 
 def merge_blocks_into_chunks(raw_blocks, max_chars=800):
-    """
-    智能合并算法：将散碎的段落合并成较大的 Section，
-    直到字符数超过 max_chars。
-    """
     chunks = []
     if not raw_blocks: return chunks
     
     current_chunk = {"text": "", "html": ""}
     
     for block in raw_blocks:
-        # 如果当前块加上新块还没超标，就合并
         if len(current_chunk["text"]) + len(block["text"]) < max_chars:
             current_chunk["text"] += "\n" + block["text"]
             current_chunk["html"] += block["html"]
         else:
-            # 超标了，先保存当前的（如果有内容）
             if current_chunk["text"]:
                 chunks.append(current_chunk)
-            # 开启新块
             current_chunk = {"text": block["text"], "html": block["html"]}
             
-    # 别忘了最后一个
     if current_chunk["text"]:
         chunks.append(current_chunk)
         
     return chunks
 
 # ============================================================
-# AI 逻辑 (带详细错误捕捉)
+# AI 逻辑 
 # ============================================================
 def pcm16_to_wav_bytes(pcm: bytes, rate: int = 24000) -> bytes:
     buf = io.BytesIO()
@@ -202,14 +194,11 @@ def pcm16_to_wav_bytes(pcm: bytes, rate: int = 24000) -> bytes:
     return buf.getvalue()
 
 def gemini_tts(text: str, voice: str):
-    """返回 (wav_bytes, error_msg)"""
     if not GEMINI_AVAILABLE: return None, "未安装 google-genai 库"
     api_key = get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY")
     if not api_key: return None, "未设置 GEMINI_API_KEY"
     
     client = genai.Client(api_key=api_key)
-    
-    # 保护性截断
     safe_text = text[:4500] 
     
     try:
@@ -231,14 +220,41 @@ def gemini_tts(text: str, voice: str):
     except Exception as e:
         return None, str(e)
 
+@st.cache_data(show_spinner=False)
+def gemini_translate(text: str) -> str:
+    if not GEMINI_AVAILABLE: return "Error: 库未安装"
+    api_key = get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY")
+    client = genai.Client(api_key=api_key)
+    prompt = f"Translate the following text to Simplified Chinese.\nKeep the tone natural.\n\n{text}"
+    try:
+        resp = client.models.generate_content(model=TEXT_MODEL_ID, contents=prompt)
+        return resp.text.strip()
+    except Exception as e:
+        return f"翻译出错: {str(e)}"
+
+@st.cache_data(show_spinner=False)
+def openai_translate(text: str) -> str:
+    if not OPENAI_AVAILABLE: return "Error: openai not installed"
+    client = OpenAI(api_key=get_secret("OPENAI_API_KEY"))
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": f"Translate to Chinese:\n\n{text}"}]
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"OpenAI Error: {e}"
+
 # ============================================================
 # Main UI
 # ============================================================
 def main():
-    # Session State 初始化
+    # Session State
     if "playing_idx" not in st.session_state: st.session_state.playing_idx = None
     if "audio_data" not in st.session_state: st.session_state.audio_data = None
     if "auto_next_trigger" not in st.session_state: st.session_state.auto_next_trigger = False
+    # 增加一个 unique_id 用于强制刷新 audio 标签
+    if "audio_uid" not in st.session_state: st.session_state.audio_uid = str(uuid.uuid4())
 
     with st.sidebar:
         st.header("📖 EPUB AI Reader")
@@ -249,14 +265,27 @@ def main():
         if not GEMINI_AVAILABLE: st.error("⚠️ 需要安装 google-genai")
         voice = st.selectbox("声音", ["Kore", "Zephyr", "Puck", "Charon", "Fenrir"], index=0)
         speed = st.slider("语速", 0.5, 2.0, 1.25, 0.1)
-        
-        # 调整合并粒度
-        chunk_size = st.slider("分段长度 (字符)", 300, 2000, 800, 100, help="把多个短段落合并成一个大段朗读，减少点击次数。")
-        auto_play = st.checkbox("自动连播 (实验性)", value=True, help="一段播完自动尝试播放下一段")
+        chunk_size = st.slider("分段长度", 300, 2000, 800, 100)
+        auto_play = st.checkbox("自动连播", value=True)
 
         st.divider()
-        st.subheader("🛠️ 外观")
+        st.subheader("🛠️ 视图设置")
+        view_mode = st.radio("模式", ["阅读模式", "对照翻译"], index=0)
+        if view_mode == "对照翻译":
+            trans_engine = st.selectbox("翻译引擎", ["Gemini", "OpenAI"])
         theme = st.radio("主题", ["Light", "Dark"], index=1, horizontal=True)
+        
+        # 隐藏的触发按钮（放在侧边栏最底部）
+        def trigger_next():
+            st.session_state.auto_next_trigger = True
+            # 关键：清除旧音频，防止 Rerun 时显示旧的播放器
+            st.session_state.audio_data = None
+        
+        st.markdown("---")
+        # 这个按钮是 JS 点击的目标
+        st.button("NEXT_TRIGGER", key="hidden_next_btn", on_click=trigger_next, type="secondary")
+        # 视觉隐藏
+        st.markdown("<style>div.stButton > button:contains('NEXT_TRIGGER') { display: none; }</style>", unsafe_allow_html=True)
 
     if not uploaded:
         st.info("👈 请在左侧上传 EPUB 文件。")
@@ -292,7 +321,7 @@ def main():
             st.session_state.playing_idx = None
             st.rerun()
             
-    # 提取内容并合并
+    # 内容处理
     raw_blocks = extract_chapter_content(epub_bytes, book, st.session_state.chapter_idx)
     chunks = merge_blocks_into_chunks(raw_blocks, max_chars=chunk_size)
     
@@ -300,170 +329,162 @@ def main():
         st.warning("本章内容为空。")
         st.stop()
 
-    # ------------------------------------------------------------
-    # 核心交互逻辑 (渲染列表 + 处理点击)
-    # ------------------------------------------------------------
+    # ============================================================
+    # 逻辑核心：处理自动连播触发 & 音频生成
+    # ============================================================
     
-    st.caption(f"当前章节共 {len(chunks)} 个朗读分段 (基于 {chunk_size} 字符合并)。")
-    
-    # 自定义样式：让按钮和文本对齐更好
-    st.markdown("""
-    <style>
-    div.stButton > button {
-        width: 100%;
-        height: 100%;
-        min-height: 60px; /* 让按钮高一点，容易点 */
-        white-space: normal;
-        word-wrap: break-word;
-    }
-    .chunk-box {
-        padding: 10px;
-        border-radius: 8px;
-        margin-bottom: 10px;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-    
-    # 检查是否触发了自动连播
+    # 1. 如果是由 JS 触发了自动下一段
     if st.session_state.auto_next_trigger:
-        next_idx = st.session_state.playing_idx + 1
+        next_idx = st.session_state.playing_idx + 1 if st.session_state.playing_idx is not None else 0
         if next_idx < len(chunks):
-            # 自动触发生成逻辑
             st.session_state.playing_idx = next_idx
+            st.session_state.audio_data = None # 确保为空，强制进入生成逻辑
             st.session_state.auto_next_trigger = False # 重置触发器
-            # 不需要 rerun，直接流转到下面的生成逻辑
         else:
-            st.toast("本章朗读结束")
+            st.toast("本章播放结束")
             st.session_state.auto_next_trigger = False
 
-    # 遍历显示所有分段
+    # 2. 生成音频 (如果需要)
+    # 只有当 playing_idx 有值，但 audio_data 为空时，才生成
+    if st.session_state.playing_idx is not None and st.session_state.audio_data is None:
+        idx = st.session_state.playing_idx
+        text = chunks[idx]["text"]
+        
+        # 在顶部显示明显的加载状态
+        with st.spinner(f"正在生成第 {idx+1}/{len(chunks)} 段音频 (Gemini)..."):
+            wav, err = gemini_tts(text, voice)
+            
+        if err:
+            st.error(f"生成失败: {err}")
+            st.session_state.playing_idx = None
+        else:
+            st.session_state.audio_data = wav
+            # 关键修复：生成一个新的随机 ID，强迫浏览器认为这是个新音频，解决循环播放旧音频的问题
+            st.session_state.audio_uid = str(uuid.uuid4())
+            st.rerun() # 刷新页面显示播放器
+
+    # ============================================================
+    # 播放器组件 (置顶 Fixed)
+    # ============================================================
+    if st.session_state.audio_data and st.session_state.playing_idx is not None:
+        b64 = base64.b64encode(st.session_state.audio_data).decode()
+        idx = st.session_state.playing_idx
+        # 自动连播 JS
+        on_end_js = ""
+        if auto_play and idx + 1 < len(chunks):
+            # 寻找 innerText 为 NEXT_TRIGGER 的按钮并点击
+            on_end_js = """
+            aud.onended = function() {
+                const btns = window.parent.document.querySelectorAll('button');
+                for (let btn of btns) {
+                    if (btn.innerText === "NEXT_TRIGGER") {
+                        btn.click();
+                        break;
+                    }
+                }
+            };
+            """
+        
+        # 顶部固定播放栏 HTML
+        # 使用 audio_uid 作为 ID 的一部分，解决缓存问题
+        player_html = f"""
+        <div style="
+            position: fixed; top: 0; left: 0; right: 0; 
+            background: #1e1e1e; border-bottom: 1px solid #444; 
+            padding: 10px 20px; z-index: 999999; 
+            display: flex; align-items: center; justify-content: center; gap: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.5);
+        ">
+            <span style="color: #fff; font-weight: bold; white-space: nowrap;">
+                🎧 {idx+1} / {len(chunks)}
+            </span>
+            <audio id="audio_{st.session_state.audio_uid}" controls autoplay style="width: 100%; max-width: 600px; height: 35px;">
+                <source src="data:audio/wav;base64,{b64}" type="audio/wav">
+            </audio>
+            <div style="color: #888; font-size: 12px; white-space: nowrap;">
+                {'自动下一段' if auto_play else '单段播放'}
+            </div>
+        </div>
+        <script>
+            var aud = document.getElementById("audio_{st.session_state.audio_uid}");
+            if(aud) {{
+                aud.playbackRate = {speed};
+                {on_end_js}
+            }}
+        </script>
+        """
+        # 这里的 height=60 是给 iframe 预留的高度，确保它能显示出来
+        # 因为 CSS 设置了 fixed top，所以它会脱离文档流浮在上面
+        components.html(player_html, height=60)
+        # 为了不让内容被遮挡，加一个垫片
+        st.markdown('<div style="height: 60px;"></div>', unsafe_allow_html=True)
+
+
+    # ============================================================
+    # 内容渲染 (阅读模式 vs 翻译模式)
+    # ============================================================
+    
+    # 样式优化
+    st.markdown("""
+    <style>
+    .chunk-box { padding: 12px; border-radius: 8px; margin-bottom: 12px; line-height: 1.6; }
+    .trans-box { background: rgba(0,0,0,0.05); padding: 10px; border-radius: 8px; border-left: 3px solid #00aa00; margin-top: 5px; }
+    div.stButton > button { width: 100%; height: auto; min-height: 50px; white-space: normal; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # 渲染循环
     for i, chunk in enumerate(chunks):
         is_playing = (i == st.session_state.playing_idx)
         
-        col_btn, col_txt = st.columns([1, 8])
-        
-        with col_btn:
-            # 按钮状态：正在播放显示“播放中”，否则显示“▶”
-            label = "🔊 播放中" if is_playing else f"▶ 第 {i+1} 段"
-            btn_type = "primary" if is_playing else "secondary"
-            
-            # 点击按钮逻辑
-            if st.button(label, key=f"chunk_{i}", type=btn_type, use_container_width=True):
-                st.session_state.playing_idx = i
-                st.session_state.audio_data = None # 清除旧音频，准备生成新音频
-                st.rerun() # 立即刷新，触发下面的生成逻辑
+        # 1. 阅读模式 (左按钮 右文本)
+        if view_mode == "阅读模式":
+            col_btn, col_txt = st.columns([1, 10])
+            with col_btn:
+                btn_type = "primary" if is_playing else "secondary"
+                label = "🔊" if is_playing else f"{i+1}"
+                if st.button(label, key=f"play_{i}", type=btn_type, help="点击朗读"):
+                    st.session_state.playing_idx = i
+                    st.session_state.audio_data = None
+                    st.rerun()
+            with col_txt:
+                bg = "rgba(255, 200, 0, 0.15)" if is_playing else ("rgba(255,255,255,0.05)" if theme=="Dark" else "#f0f2f6")
+                border = "2px solid #ffbd45" if is_playing else "1px solid transparent"
+                st.markdown(f'<div class="chunk-box" style="background:{bg}; border:{border}">{chunk["html"]}</div>', unsafe_allow_html=True)
 
-        with col_txt:
-            bg_color = "rgba(255, 200, 0, 0.15)" if is_playing else ("rgba(255,255,255,0.05)" if theme=="Dark" else "#f0f2f6")
-            border = "2px solid #ffbd45" if is_playing else "1px solid transparent"
+        # 2. 对照翻译模式 (左原文+播放，右译文)
+        else:
+            col_left, col_right = st.columns(2)
             
-            # 显示文本内容
-            st.markdown(
-                f'<div class="chunk-box" style="background:{bg_color}; border:{border}">'
-                f'{chunk["html"]}'
-                f'</div>',
-                unsafe_allow_html=True
-            )
-
-    # ------------------------------------------------------------
-    # 音频生成与播放器 (固定底部)
-    # ------------------------------------------------------------
-    
-    # 如果处于播放状态，且音频数据还没生成，则开始生成
-    if st.session_state.playing_idx is not None:
-        idx = st.session_state.playing_idx
-        
-        # 只有当 audio_data 为空时才调用 API (防止重复调用)
-        if st.session_state.audio_data is None:
-            target_text = chunks[idx]["text"]
+            # 左栏：原文 + 播放按钮
+            with col_left:
+                c_btn, c_txt = st.columns([1.5, 8.5])
+                with c_btn:
+                    btn_type = "primary" if is_playing else "secondary"
+                    if st.button(f"Play {i+1}", key=f"play_tr_{i}", type=btn_type):
+                        st.session_state.playing_idx = i
+                        st.session_state.audio_data = None
+                        st.rerun()
+                with c_txt:
+                    bg = "rgba(255, 200, 0, 0.15)" if is_playing else "transparent"
+                    border = "2px solid #ffbd45" if is_playing else "1px solid #444"
+                    st.markdown(f'<div class="chunk-box" style="background:{bg}; border:{border}">{chunk["html"]}</div>', unsafe_allow_html=True)
             
-            # 弹出一个明显的 Toast 提示
-            st.toast(f"正在生成第 {idx+1} 段音频，请稍候...", icon="⏳")
-            
-            # 在底部显示转圈圈
-            with st.spinner(f"Gemini 正在合成第 {idx+1} 段 ({len(target_text)} 字符)..."):
-                wav, err = gemini_tts(target_text, voice)
-                
-            if err:
-                st.error(f"生成失败: {err}")
-                st.session_state.playing_idx = None # 重置状态
-            else:
-                st.session_state.audio_data = wav
-                st.rerun() # 生成完毕，刷新显示播放器
-
-        # 如果有音频数据，显示播放器
-        if st.session_state.audio_data:
-            b64 = base64.b64encode(st.session_state.audio_data).decode()
-            
-            # 自动连播逻辑：
-            # 我们创建一个隐藏的 button，当 audio onended 时，JS 点击这个 button
-            # 这个 button 的 callback 会设置 auto_next_trigger = True
-            
-            # 这里的 JS 有点技巧：它寻找页面上特定的 hidden button 并 click 它
-            on_end_js = ""
-            if auto_play and idx + 1 < len(chunks):
-                on_end_js = """
-                aud.onended = function() {
-                    // 寻找 id 为 next-trigger-btn 的按钮并点击
-                    const btns = window.parent.document.querySelectorAll('button');
-                    for (let btn of btns) {
-                        if (btn.innerText === "NEXT_TRIGGER") {
-                            btn.click();
-                            break;
-                        }
-                    }
-                };
-                """
-            
-            # 播放器组件
-            player_html = f"""
-            <div style="position:fixed; bottom:0; left:0; right:0; background:#262730; border-top:1px solid #444; padding:15px; z-index:9999; display:flex; align-items:center; justify-content:center; gap:20px; box-shadow: 0 -5px 20px rgba(0,0,0,0.5);">
-                <span style="color:#fff; font-weight:bold; font-size:16px;">
-                    🎧 正在朗读第 {idx+1} / {len(chunks)} 段
-                </span>
-                <audio id="main-player" controls autoplay style="width: 400px; height:40px;">
-                    <source src="data:audio/wav;base64,{b64}" type="audio/wav">
-                </audio>
-                <div style="color:#aaa; font-size:12px;">(播放结束自动跳下一段)</div>
-            </div>
-            <script>
-                var aud = document.getElementById("main-player");
-                if(aud) {{
-                    aud.playbackRate = {speed};
-                    {on_end_js}
-                }}
-            </script>
-            """
-            components.html(player_html, height=80)
-            
-            # 这是一个“隐形”的按钮，用于接收 JS 的点击事件
-            # 当它被点击时，触发 Python 逻辑跳转下一段
-            def trigger_next():
-                st.session_state.auto_next_trigger = True
-                
-            # 我们把这个按钮藏在视觉死角，或者用 CSS 隐藏，但 Streamlit button 很难完全隐藏
-            # 我们可以把它放在 sidebar 最下面，或者用 empty 容器
-            with st.sidebar:
-                # 这里的 label 必须和 JS 里的 innerText 匹配
-                st.button("NEXT_TRIGGER", key="auto_next_hidden_btn", on_click=trigger_next, 
-                          type="secondary")
-                # 用 CSS 隐藏这个按钮
-                st.markdown("""
-                <style>
-                button[kind="secondary"] { 
-                    /* 这是一个全局 hack，可能会误伤，但在 sidebar 底部通常没事 */
-                }
-                /* 专门针对特定文本的按钮隐藏比较难，
-                   我们把它做的很小或者透明 */
-                div.stButton > button:contains("NEXT_TRIGGER") {
-                   display: none;
-                }
-                /* 这种 CSS 选择器 Streamlit 不一定支持，
-                   所以上面的 JS 循环查找 innerText 是最稳的。
-                   为了美观，我们在 Python 端不让用户容易看到它即可。
-                */
-                </style>
-                """, unsafe_allow_html=True)
+            # 右栏：翻译
+            with col_right:
+                # 检查是否有缓存的翻译
+                cache_key = f"trans_{st.session_state.book_hash}_{st.session_state.chapter_idx}_{i}"
+                if cache_key in st.session_state:
+                    st.markdown(f'<div class="trans-box">{st.session_state[cache_key]}</div>', unsafe_allow_html=True)
+                else:
+                    if st.button("翻译", key=f"trans_btn_{i}"):
+                        with st.spinner("翻译中..."):
+                            if trans_engine == "Gemini":
+                                res = gemini_translate(chunk["text"])
+                            else:
+                                res = openai_translate(chunk["text"])
+                        st.session_state[cache_key] = res
+                        st.rerun()
 
 if __name__ == "__main__":
     main()
