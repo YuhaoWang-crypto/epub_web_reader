@@ -686,6 +686,115 @@ def build_gemini_clickable_body(blocks, current_idx: int | None):
     return "\n".join(out)
 
 
+
+# ============================================================
+# Gemini "smart" segmenting + lightweight player helpers
+# ============================================================
+def build_segments_from_blocks(blocks, max_chars: int = 1200):
+    """
+    Build segments by approximate char budget (token proxy).
+    Each segment contains contiguous block texts.
+    Returns list of dict: {start_block, end_block, text}
+    """
+    segments = []
+    buf = []
+    buf_len = 0
+    start = 0
+
+    def flush(end_block):
+        nonlocal buf, buf_len, start
+        if not buf:
+            return
+        segments.append({
+            "start_block": start,
+            "end_block": end_block,
+            "text": "\n\n".join(buf).strip()
+        })
+        buf = []
+        buf_len = 0
+        start = end_block
+
+    for i, b in enumerate(blocks):
+        t = (b.get("text") or "").strip()
+        if not t:
+            continue
+        add_len = len(t) + (2 if buf else 0)
+        if buf and (buf_len + add_len) > max_chars:
+            flush(i)
+        if not buf:
+            start = i
+        buf.append(t)
+        buf_len += add_len
+
+    flush(len(blocks))
+    if not segments:
+        segments = [{"start_block": 0, "end_block": len(blocks), "text": "\n\n".join((b.get("text") or "") for b in blocks)}]
+    return segments
+
+
+def build_block_to_segment_map(blocks, segments):
+    """
+    Map each block index -> segment index that starts at/contains it.
+    """
+    m = [0] * max(1, len(blocks))
+    seg_idx = 0
+    for i in range(len(blocks)):
+        while seg_idx + 1 < len(segments) and i >= segments[seg_idx]["end_block"]:
+            seg_idx += 1
+        m[i] = seg_idx
+    return m
+
+
+def wav_bytes_to_data_uri(wav_bytes: bytes) -> str:
+    b64 = base64.b64encode(wav_bytes).decode("ascii")
+    return f"data:audio/wav;base64,{b64}"
+
+
+def render_two_stage_player(cur_wav: bytes, next_wav: bytes | None, autoplay: bool, next_seg: int | None):
+    """
+    HTML audio player that can auto-continue to next segment.
+    If next_wav is provided, it preloads next and plays it after current ends.
+    After current ends, it can also navigate to ?tts_seg=next_seg&autoplay=1 to persist position.
+    """
+    cur_uri = wav_bytes_to_data_uri(cur_wav) if cur_wav else ""
+    next_uri = wav_bytes_to_data_uri(next_wav) if next_wav else ""
+    ap = "true" if autoplay else "false"
+    nxt = str(next_seg) if next_seg is not None else ""
+
+    html = f"""
+    <div style="padding:8px 0;">
+      <audio id="a1" src="{cur_uri}" {"autoplay" if autoplay else ""} controls style="width:100%"></audio>
+      <audio id="a2" src="{next_uri}" preload="auto" style="display:none"></audio>
+    </div>
+    <script>
+      (function() {{
+        const a1 = document.getElementById("a1");
+        const a2 = document.getElementById("a2");
+        const hasNext = Boolean("{next_uri}") && Boolean("{nxt}");
+
+        // If autoplay requested, try play (some browsers require user gesture; Streamlit usually ok after button click)
+        if ({ap}) {{
+          a1.play().catch(()=>{{}});
+        }}
+
+        a1.addEventListener("ended", () => {{
+          if (hasNext) {{
+            // Play next locally for continuity
+            a2.style.display = "block";
+            a2.play().catch(()=>{{}});
+            // Persist position by navigating (fast, because next is pre-generated in cache)
+            // This will refresh the Streamlit app and set cursor to next segment.
+            setTimeout(() => {{
+              window.top.location.search = "?tts_seg={nxt}&autoplay=1";
+            }}, 200);
+          }}
+        }});
+      }})();
+    </script>
+    """
+    components.html(html, height=110, scrolling=False)
+
+
 # ============================================================
 # Gemini TTS helpers (WAV)
 # ============================================================
@@ -832,8 +941,13 @@ if "book_hash" not in st.session_state or st.session_state.book_hash != book_has
     st.session_state.chapter_idx = 0
     st.session_state.page_idx = 0
     st.session_state.g_tts_pos = 0
+    st.session_state.g_seg_idx = 0
+    st.session_state.g_autoplay = False
+    st.session_state.g_audio_cache = {}  # {seg_idx: wav_bytes}
 
 qp = get_query_params()
+
+# Click-to-set start (paragraph/block index)
 if "tts_start" in qp:
     try:
         raw = qp["tts_start"][0] if isinstance(qp["tts_start"], list) else qp["tts_start"]
@@ -841,6 +955,25 @@ if "tts_start" in qp:
         st.session_state.g_tts_pos = max(0, idx)
     except Exception:
         pass
+
+# Segment cursor update (auto-continue or manual navigation)
+if "tts_seg" in qp:
+    try:
+        raw = qp["tts_seg"][0] if isinstance(qp["tts_seg"], list) else qp["tts_seg"]
+        st.session_state.g_seg_idx = max(0, int(raw))
+    except Exception:
+        pass
+
+# Autoplay flag (used after auto-continue)
+if "autoplay" in qp:
+    try:
+        raw = qp["autoplay"][0] if isinstance(qp["autoplay"], list) else qp["autoplay"]
+        st.session_state.g_autoplay = (str(raw) == "1" or str(raw).lower() == "true")
+    except Exception:
+        st.session_state.g_autoplay = False
+
+# Clear params so refresh won't re-trigger forever
+if ("tts_start" in qp) or ("tts_seg" in qp) or ("autoplay" in qp):
     set_query_params()
 
 meta_cols = st.columns([1, 4])
@@ -873,6 +1006,9 @@ if selected != st.session_state.chapter_idx:
     st.session_state.chapter_idx = int(selected)
     st.session_state.page_idx = 0
     st.session_state.g_tts_pos = 0
+    st.session_state.g_seg_idx = 0
+    st.session_state.g_autoplay = False
+    st.session_state.g_audio_cache = {}  # {seg_idx: wav_bytes}
 
 nav_cols = st.columns([1, 1, 6])
 with nav_cols[0]:
@@ -880,12 +1016,18 @@ with nav_cols[0]:
         st.session_state.chapter_idx -= 1
         st.session_state.page_idx = 0
         st.session_state.g_tts_pos = 0
+    st.session_state.g_seg_idx = 0
+    st.session_state.g_autoplay = False
+    st.session_state.g_audio_cache = {}  # {seg_idx: wav_bytes}
         st.rerun()
 with nav_cols[1]:
     if st.button("下一章", disabled=(st.session_state.chapter_idx >= chapter_count - 1), use_container_width=True):
         st.session_state.chapter_idx += 1
         st.session_state.page_idx = 0
         st.session_state.g_tts_pos = 0
+    st.session_state.g_seg_idx = 0
+    st.session_state.g_autoplay = False
+    st.session_state.g_audio_cache = {}  # {seg_idx: wav_bytes}
         st.rerun()
 with nav_cols[2]:
     st.markdown(f"### {labels[st.session_state.chapter_idx]}")
@@ -913,6 +1055,22 @@ elif view_mode == "对照翻译（英->中）":
         st.warning("本章无可分页内容。")
     else:
         max_page = len(pages)
+
+        # 额外的主页面导航（避免侧边栏滚动导致你找不到“页”滑条）
+        nav1, nav2, nav3, nav4 = st.columns([1, 1, 2, 4])
+        with nav1:
+            if st.button("上一页", disabled=(st.session_state.page_idx <= 0), use_container_width=True, key="page_prev_btn"):
+                st.session_state.page_idx = max(0, st.session_state.page_idx - 1)
+                st.rerun()
+        with nav2:
+            if st.button("下一页", disabled=(st.session_state.page_idx >= max_page - 1), use_container_width=True, key="page_next_btn"):
+                st.session_state.page_idx = min(max_page - 1, st.session_state.page_idx + 1)
+                st.rerun()
+        with nav3:
+            st.markdown(f"**页：{st.session_state.page_idx + 1} / {max_page}**")
+        with nav4:
+            st.caption("说明：对照翻译按“每页段落数”分页显示，不会丢段落；若页数很多请用上一页/下一页切换。")
+
         page_idx = st.sidebar.slider("页", 1, max_page, min(max_page, st.session_state.page_idx + 1), 1) - 1
         st.session_state.page_idx = int(page_idx)
 
@@ -1007,6 +1165,9 @@ else:
 # ============================================================
 # Gemini main reading controls (stateful position)
 # ============================================================
+# ============================================================
+# Gemini main reading controls (segment-based + prefetch cache)
+# ============================================================
 if view_mode == "排版（HTML）" and tts_mode.startswith("Gemini"):
     st.divider()
     st.subheader("在线朗读（Gemini 主阅读声音）")
@@ -1018,7 +1179,8 @@ if view_mode == "排版（HTML）" and tts_mode.startswith("Gemini"):
         if not api_key_present:
             st.warning("未检测到 GEMINI_API_KEY/GOOGLE_API_KEY。请配置后再使用 Gemini 朗读。")
 
-        colA, colB, colC, colD = st.columns([2, 2, 2, 2])
+        # Settings
+        colA, colB, colC, colD = st.columns([2, 2, 3, 2])
         with colA:
             voice = st.selectbox("声音", ["Kore", "Zephyr", "Puck", "Charon", "Fenrir"], index=0)
         with colB:
@@ -1026,106 +1188,97 @@ if view_mode == "排版（HTML）" and tts_mode.startswith("Gemini"):
         with colC:
             style = st.text_input("风格（可选）", value="请用温柔、自然、略慢的语气朗读：")
         with colD:
-            chunk_blocks = st.number_input("每次朗读段落数", min_value=1, max_value=12, value=3, step=1)
+            max_chars = st.number_input("每段最大字符（≈token）", min_value=400, max_value=2600, value=1200, step=100)
 
         blocks = extract_chapter_blocks(epub_bytes, book, st.session_state.chapter_idx)
-        total = len(blocks)
+        if not blocks:
+            st.warning("本章无可朗读文本。")
+        else:
+            segments = build_segments_from_blocks(blocks, max_chars=int(max_chars))
+            b2s = build_block_to_segment_map(blocks, segments)
 
-        st.caption(
-            f"当前位置：第 {st.session_state.g_tts_pos + 1} 段 / 共 {total} 段。"
-            f"（点击正文段落可重设起点；停止后位置会被记住。）"
-        )
+            # Synchronize segment cursor with block cursor (from click)
+            st.session_state.g_seg_idx = max(0, min(len(segments) - 1, int(st.session_state.get("g_seg_idx", 0))))
+            st.session_state.g_tts_pos = max(0, min(len(blocks) - 1, int(st.session_state.get("g_tts_pos", 0))))
+            st.session_state.g_seg_idx = b2s[st.session_state.g_tts_pos]
 
-        start = max(0, min(st.session_state.g_tts_pos, max(0, total - 1)))
-        end = min(total, start + int(chunk_blocks))
-        tts_text = "\n\n".join(b["text"] for b in blocks[start:end]) if blocks else ""
+            # Cache dict
+            if "g_audio_cache" not in st.session_state or not isinstance(st.session_state.g_audio_cache, dict):
+                st.session_state.g_audio_cache = {}
 
-        btn1, btn2, btn3 = st.columns(3)
-        with btn1:
-            play = st.button("播放这一段（从当前位置）", use_container_width=True)
-        with btn2:
-            prev = st.button("后退一段", use_container_width=True, disabled=(start <= 0))
-        with btn3:
-            nxt = st.button("前进一段", use_container_width=True, disabled=(end >= total))
+            # Controls
+            cur = st.session_state.g_seg_idx
+            total = len(segments)
+            cur_seg = segments[cur]
+            next_seg = cur + 1 if (cur + 1 < total) else None
 
-        if prev:
-            st.session_state.g_tts_pos = max(0, st.session_state.g_tts_pos - 1)
-            st.rerun()
+            st.caption(
+                f"当前位置：段 {cur + 1}/{total}（覆盖原文第 {cur_seg['start_block'] + 1}–{max(cur_seg['end_block'], cur_seg['start_block']+1)} 段）。"
+                " 点击正文任意段落可重设起点；停止后位置会被记住。"
+            )
 
-        if nxt:
-            st.session_state.g_tts_pos = min(max(0, total - 1), st.session_state.g_tts_pos + 1)
-            st.rerun()
+            c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+            with c1:
+                play = st.button("播放（从当前位置）", use_container_width=True)
+            with c2:
+                prev = st.button("上一段", use_container_width=True, disabled=(cur <= 0))
+            with c3:
+                nxt = st.button("下一段", use_container_width=True, disabled=(next_seg is None))
+            with c4:
+                clear = st.button("清空缓存", use_container_width=True)
 
-        if play:
-            if not tts_text.strip():
-                st.warning("没有可朗读文本。")
-            else:
+            if clear:
+                st.session_state.g_audio_cache = {}
+                st.session_state.g_autoplay = False
+                st.success("已清空缓存。")
+
+            if prev:
+                st.session_state.g_seg_idx = max(0, cur - 1)
+                st.session_state.g_tts_pos = segments[st.session_state.g_seg_idx]["start_block"]
+                st.session_state.g_autoplay = False
+                st.rerun()
+
+            if nxt:
+                st.session_state.g_seg_idx = min(total - 1, cur + 1)
+                st.session_state.g_tts_pos = segments[st.session_state.g_seg_idx]["start_block"]
+                st.session_state.g_autoplay = False
+                st.rerun()
+
+            # Autoplay triggered after auto-continue refresh
+            autoplay = bool(st.session_state.get("g_autoplay", False))
+            st.session_state.g_autoplay = False  # consume
+
+            # Generate audio on demand (and prefetch next)
+            if play or autoplay:
                 try:
-                    with st.spinner("正在生成音频（WAV）…"):
-                        wav_bytes = gemini_tts_wav(tts_text, voice_name=voice, model=model, style=style)
-                    st.audio(wav_bytes, format="audio/wav")
+                    # current
+                    if cur not in st.session_state.g_audio_cache:
+                        with st.spinner("正在生成当前段音频（WAV）…"):
+                            st.session_state.g_audio_cache[cur] = gemini_tts_wav(
+                                cur_seg["text"], voice_name=voice, model=model, style=style
+                            )
+
+                    # next prefetch (best-effort)
+                    next_wav = None
+                    if next_seg is not None:
+                        if next_seg not in st.session_state.g_audio_cache:
+                            with st.spinner("预缓存下一段音频…"):
+                                st.session_state.g_audio_cache[next_seg] = gemini_tts_wav(
+                                    segments[next_seg]["text"], voice_name=voice, model=model, style=style
+                                )
+                        next_wav = st.session_state.g_audio_cache.get(next_seg)
+
+                    cur_wav = st.session_state.g_audio_cache.get(cur)
+                    # Render player that can continue to next and persist position
+                    render_two_stage_player(
+                        cur_wav=cur_wav,
+                        next_wav=next_wav,
+                        autoplay=True,
+                        next_seg=next_seg
+                    )
                 except Exception as e:
                     st.error(f"Gemini TTS 失败：{e}")
                     st.caption("若出现 429 RESOURCE_EXHAUSTED：说明配额/速率耗尽，需要稍后重试或启用计费。")
-
-
-# ============================================================
-# Edge TTS helpers (MP3)  - required for "生成本章 MP3" block
-# ============================================================
-def _chunk_text(text: str, max_chars: int = 3000):
-    paras = [p.strip() for p in re.split(r"\n{2,}|\r\n{2,}", text) if p.strip()]
-    chunks, buf = [], ""
-    for p in paras:
-        if not buf:
-            buf = p
-        elif len(buf) + 2 + len(p) <= max_chars:
-            buf += "\n\n" + p
-        else:
-            chunks.append(buf)
-            buf = p
-    if buf:
-        chunks.append(buf)
-
-    out = []
-    for c in chunks:
-        if len(c) <= max_chars:
-            out.append(c)
-        else:
-            for i in range(0, len(c), max_chars):
-                out.append(c[i:i + max_chars])
-    return out
-
-
-def _strip_id3_if_present(mp3_bytes: bytes) -> bytes:
-    # Remove ID3 header on concatenation to avoid repeated tags.
-    if len(mp3_bytes) < 10:
-        return mp3_bytes
-    if mp3_bytes[:3] != b"ID3":
-        return mp3_bytes
-    size_bytes = mp3_bytes[6:10]
-    size = ((size_bytes[0] & 0x7F) << 21) | ((size_bytes[1] & 0x7F) << 14) | ((size_bytes[2] & 0x7F) << 7) | (size_bytes[3] & 0x7F)
-    start = 10 + size
-    return mp3_bytes[start:] if start < len(mp3_bytes) else mp3_bytes
-
-
-async def edge_tts_mp3_from_text(text: str, voice: str, rate: str, pitch: str, volume: str) -> bytes:
-    audio = bytearray()
-    communicate = edge_tts.Communicate(text, voice=voice, rate=rate, pitch=pitch, volume=volume)
-    async for chunk in communicate.stream():
-        if chunk.get("type") == "audio":
-            audio.extend(chunk["data"])
-    return bytes(audio)
-
-
-async def edge_tts_mp3_long(text: str, voice: str, rate: str, pitch: str, volume: str, max_chars: int = 3000) -> bytes:
-    parts = _chunk_text(text, max_chars=max_chars)
-    out = bytearray()
-    for i, part in enumerate(parts):
-        mp3_part = await edge_tts_mp3_from_text(part, voice, rate, pitch, volume)
-        if i > 0:
-            mp3_part = _strip_id3_if_present(mp3_part)
-        out.extend(mp3_part)
-    return bytes(out)
 
 
 # ============================================================
