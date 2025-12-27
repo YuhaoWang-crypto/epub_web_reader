@@ -1197,11 +1197,11 @@ else:
                 # show only first 60 segments to avoid huge UI; for long books you can adjust max_chars to reduce count
                 max_show = min(80, len(_segs_for_list))
                 for si in range(max_show):
-                    seg = _segs_for_List[si]
+                    seg = _segs_for_list[si]
                     label = f"{si+1}  ({seg['start_block']+1}-{max(seg['end_block'], seg['start_block']+1)})"
                     if st.button(label, key=f"seg_btn_{si}", use_container_width=True):
                         st.session_state.g_seg_idx = si
-                        st.session_state.g_tts_pos = _segs_for_List[si]["start_block"]
+                        st.session_state.g_tts_pos = _segs_for_list[si]["start_block"]
                         st.session_state.g_autoplay = True
                         st.rerun()
                 if len(_segs_for_list) > max_show:
